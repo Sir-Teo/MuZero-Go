@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -p a100_long
+#SBATCH -p a100_short,a100_long
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120GB
-#SBATCH --time=7-00:00:00
+#SBATCH --time=3-00:00:00
 #SBATCH --job-name=train
 #SBATCH --output=/gpfs/scratch/wz1492/MuZero-Go/logs/train-%J.log
 #SBATCH --exclude=a100-4020

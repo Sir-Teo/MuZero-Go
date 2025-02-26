@@ -8,10 +8,14 @@ import torch.nn.functional as F
 import numpy as np
 import random
 from collections import deque
-import matplotlib.pyplot as plt
 import logging
 import wandb
 import warnings
+from multiprocessing import Pool
+import torch.multiprocessing as mp
+import argparse
+import os
+import pickle
 
 # --- Suppress gym warnings ---
 warnings.filterwarnings("ignore", category=UserWarning, module="gym.utils.passive_env_checker")
@@ -28,7 +32,7 @@ class Config:
     latent_dim = 64
     learning_rate = 5e-4
     mcts_simulations = 64
-    num_episodes = 1000000
+    num_episodes = 500000
     replay_buffer_size = 10000
     batch_size = 128
     unroll_steps = 10
@@ -46,23 +50,7 @@ class Config:
 
 config = Config()
 
-# Initialize wandb
-wandb.init(project="muzero_go", config={
-    "board_size": config.board_size,
-    "latent_dim": config.latent_dim,
-    "learning_rate": config.learning_rate,
-    "mcts_simulations": config.mcts_simulations,
-    "num_episodes": config.num_episodes,
-    "batch_size": config.batch_size,
-    "unroll_steps": config.unroll_steps,
-    "discount": config.discount,
-    "dirichlet_epsilon": config.dirichlet_epsilon,
-    "dirichlet_alpha": config.dirichlet_alpha,
-    "initial_elo": config.initial_elo,
-    "elo_k": config.elo_k
-})
-
-# Set device to GPU if available
+# --- Set device to GPU if available ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Network Modules ---
@@ -159,17 +147,16 @@ class MCTS:
         # Append validity for the pass move (always valid)
         valid_mask = np.concatenate([valid_mask, np.array([1.0])])
 
-        # If there are legal (non-pass) moves, slightly penalize the pass move:
         if valid_mask[:-1].sum() > 0:
-            valid_mask[-1] *= 0.9  # reduce pass move probability a bit
+            valid_mask[-1] *= 0.9
 
         masked_policy = policy * valid_mask
         if masked_policy.sum() > 0:
             masked_policy = masked_policy / masked_policy.sum()
         else:
-            masked_policy = valid_mask / valid_mask.sum()  # fallback
+            masked_policy = valid_mask / valid_mask.sum()
 
-        # Add Dirichlet noise to the root prior to encourage exploration
+        # Add Dirichlet noise to the root prior
         noise = np.random.dirichlet([config.dirichlet_alpha] * len(masked_policy))
         masked_policy = (1 - config.dirichlet_epsilon) * masked_policy + config.dirichlet_epsilon * noise
 
@@ -223,29 +210,23 @@ class MuZeroAgent:
         self.optimizer = optim.Adam(self.net.parameters(), lr=config.learning_rate)
 
     def select_action(self, observation):
-        # Extract invalid move mask from observation
         invalid_moves = observation[govars.INVD_CHNL]
         valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-        # Append validity for the pass move
         valid_mask = np.concatenate([valid_mask, np.array([1.0])])
-        # If board moves exist, penalize pass move slightly:
         if valid_mask[:-1].sum() > 0:
             valid_mask[-1] *= 0.9
 
         mcts = MCTS(self.net, self.action_size, self.mcts_simulations)
         root = mcts.run(observation)
-
         visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0
                                   for a, child in root.children.items()])
 
-        # Check if there are any visits for valid moves
         if visit_counts.sum() > 0:
             best_action = int(np.argmax(visit_counts))
         else:
             valid_actions = [a for a, valid in enumerate(valid_mask) if valid > 0]
             best_action = random.choice(valid_actions)
 
-        # (Optional) Build policy target for training purposes
         if visit_counts.sum() > 0:
             policy_target = visit_counts / visit_counts.sum()
         else:
@@ -348,7 +329,7 @@ class Evaluator:
         self.avg_rewards = []
         self.win_rates = []
         self.elo_ratings = []
-        self.elo_rating = config.initial_elo  # starting ELO rating
+        self.elo_rating = config.initial_elo
 
     def evaluate(self, episode):
         total_rewards = []
@@ -357,7 +338,6 @@ class Evaluator:
         with torch.no_grad():
             for _ in range(self.num_eval_episodes):
                 obs = self.env.reset()
-                # Handle tuple return from reset if needed
                 if isinstance(obs, tuple):
                     obs = obs[0]
                 done = False
@@ -365,7 +345,6 @@ class Evaluator:
                 while not done:
                     action, _ = self.agent.select_action(obs)
                     result = self.env.step(action)
-                    # Handle possible new API with truncated flag
                     if len(result) == 5:
                         obs, reward, done, truncated, info = result
                         done = done or truncated
@@ -381,7 +360,6 @@ class Evaluator:
         avg_reward = np.mean(total_rewards)
         win_rate = wins / self.num_eval_episodes
 
-        # Update ELO rating against a fixed opponent rating (assumed 1000)
         opponent_rating = 1000
         expected = 1 / (1 + 10 ** ((opponent_rating - self.elo_rating) / 400))
         self.elo_rating = self.elo_rating + config.elo_k * (win_rate - expected)
@@ -392,117 +370,125 @@ class Evaluator:
         self.elo_ratings.append(self.elo_rating)
         return avg_reward, win_rate, self.elo_rating
 
-# --- Main Training Loop with Trajectory Replay, Periodic Model Saving, Wandb Logging & Plotting ---
-def main():
-    board_size = config.board_size
+# --- Worker Function for Parallel Self-play ---
+def simulate_episode(args):
+    # This worker does not initialize wandb, avoiding duplicate logins.
+    agent_state_dict, board_size, latent_dim, action_size, num_simulations = args
+    local_agent = MuZeroAgent(board_size, latent_dim, action_size, num_simulations)
+    local_agent.net.load_state_dict(agent_state_dict)
     env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
-    action_size = env.action_space.n  # board moves + pass
-    agent = MuZeroAgent(board_size, config.latent_dim, action_size, num_simulations=config.mcts_simulations)
-    num_episodes = config.num_episodes
-
-    replay_buffer = deque(maxlen=config.replay_buffer_size)
-    evaluation_interval = config.evaluation_interval
-
-    training_rewards = []
-    loss_episodes = []
-    loss_values = []
-
-    evaluator = Evaluator(agent, env, num_eval_episodes=5)
-
-    for episode in range(num_episodes):
-        obs = env.reset()
-        # If reset returns (obs, info), extract obs
+    obs = env.reset()
+    if isinstance(obs, tuple):
+        obs = obs[0]
+    done = False
+    total_reward = 0
+    trajectory = {
+        'observations': [],
+        'actions': [],
+        'rewards': [],
+        'policies': []
+    }
+    trajectory['observations'].append(obs)
+    while not done:
+        action, policy = local_agent.select_action(obs)
+        trajectory['actions'].append(action)
+        trajectory['policies'].append(policy)
+        result = env.step(action)
+        if len(result) == 5:
+            obs, reward, done, truncated, info = result
+            done = done or truncated
+        else:
+            obs, reward, done, info = result
         if isinstance(obs, tuple):
             obs = obs[0]
-        done = False
-        total_reward = 0
-        trajectory = {
-            'observations': [],
-            'actions': [],
-            'rewards': [],
-            'policies': []
-        }
+        trajectory['rewards'].append(reward)
         trajectory['observations'].append(obs)
-        while not done:
-            action, policy = agent.select_action(obs)
-            trajectory['actions'].append(action)
-            trajectory['policies'].append(policy)
-            result = env.step(action)
-            # Handle new API (with truncated flag) if present
-            if len(result) == 5:
-                obs, reward, done, truncated, info = result
-                done = done or truncated
-            else:
-                obs, reward, done, info = result
-            # If observation comes as a tuple, extract it
-            if isinstance(obs, tuple):
-                obs = obs[0]
-            trajectory['rewards'].append(reward)
-            trajectory['observations'].append(obs)
-            total_reward += reward
+        total_reward += reward
+    return trajectory, total_reward
 
-        replay_buffer.append(trajectory)
-        training_rewards.append(total_reward)
-        logger.info(f"Episode {episode} total reward: {total_reward}")
-        wandb.log({"training_reward": total_reward, "episode": episode})
+# --- Main Training Loop with Multiprocessing ---
+def main(resume, resume_file):
+    board_size = config.board_size
+    env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
+    action_size = env.action_space.n
+    agent = MuZeroAgent(board_size, config.latent_dim, action_size, num_simulations=config.mcts_simulations)
+    episode_count = 0
+    replay_buffer = deque(maxlen=config.replay_buffer_size)
+    evaluation_interval = config.evaluation_interval
+    evaluator = Evaluator(agent, env, num_eval_episodes=5)
 
-        loss = agent.train(replay_buffer, batch_size=config.batch_size)
-        if loss is not None:
-            loss_episodes.append(episode)
-            loss_values.append(loss)
-            logger.info(f"Episode {episode} training loss: {loss:.4f}")
-            wandb.log({"training_loss": loss, "episode": episode})
+    # If resuming, load the training state
+    if resume and os.path.exists(resume_file):
+        checkpoint = torch.load(resume_file, map_location=device)
+        agent.net.load_state_dict(checkpoint['agent_state_dict'])
+        episode_count = checkpoint.get('episode_count', 0)
+        logger.info(f"Resumed training from episode {episode_count}")
 
-        if episode > 0 and episode % evaluation_interval == 0:
-            avg_eval_reward, win_rate, current_elo = evaluator.evaluate(episode)
-            logger.info(f"Evaluation after episode {episode}: average reward = {avg_eval_reward:.2f}, win rate = {win_rate:.2f}, ELO = {current_elo:.2f}")
-            wandb.log({
-                "evaluation_avg_reward": avg_eval_reward,
-                "evaluation_win_rate": win_rate,
-                "elo_rating": current_elo,
-                "episode": episode
-            })
-            # Periodically save the model
-            torch.save(agent.net.state_dict(), f"muzero_model_episode_{episode}.pth")
-            logger.info(f"Model saved to 'muzero_model_episode_{episode}.pth'.")
-            wandb.save(f"muzero_model_episode_{episode}.pth")
+    num_workers = 8
+    pool = Pool(processes=num_workers)
 
-    # --- Plotting the Metrics ---
-    plt.figure(figsize=(15, 12))
-    plt.subplot(4, 1, 1)
-    plt.plot(training_rewards, label="Training Reward")
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
-    plt.title("Training Reward per Episode")
-    plt.legend()
-    plt.subplot(4, 1, 2)
-    plt.plot(evaluator.episodes, evaluator.avg_rewards, 'o-', color='orange', label="Evaluation Average Reward")
-    plt.xlabel("Episode")
-    plt.ylabel("Average Reward")
-    plt.title("Evaluation Average Reward over Time")
-    plt.legend()
-    plt.subplot(4, 1, 3)
-    plt.plot(loss_episodes, loss_values, 'o-', color='green', label="Training Loss")
-    plt.xlabel("Episode")
-    plt.ylabel("Loss")
-    plt.title("Training Loss over Time")
-    plt.legend()
-    plt.subplot(4, 1, 4)
-    plt.plot(evaluator.episodes, evaluator.elo_ratings, 'o-', color='purple', label="ELO Rating")
-    plt.xlabel("Episode")
-    plt.ylabel("ELO Rating")
-    plt.title("ELO Rating over Time")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig('training_evaluation_plot.png', dpi=300, bbox_inches='tight')
-    logger.info("Plots saved to 'training_evaluation_plot.png'.")
-    wandb.log({"training_evaluation_plot": wandb.Image('training_evaluation_plot.png')})
+    while episode_count < config.num_episodes:
+        current_state = agent.net.state_dict()
+        worker_args = [(current_state, config.board_size, config.latent_dim, action_size, config.mcts_simulations)
+                       for _ in range(num_workers)]
+        results = pool.map(simulate_episode, worker_args)
+        for trajectory, total_reward in results:
+            replay_buffer.append(trajectory)
+            logger.info(f"Episode {episode_count} total reward: {total_reward}")
+            wandb.log({"training_reward": total_reward, "episode": episode_count})
+            episode_count += 1
 
-    # --- Save the final trained model ---
+            loss = agent.train(replay_buffer, batch_size=config.batch_size)
+            if loss is not None:
+                logger.info(f"Episode {episode_count} training loss: {loss:.4f}")
+                wandb.log({"training_loss": loss, "episode": episode_count})
+
+            if episode_count > 0 and episode_count % evaluation_interval == 0:
+                avg_eval_reward, win_rate, current_elo = evaluator.evaluate(episode_count)
+                logger.info(f"Evaluation after episode {episode_count}: average reward = {avg_eval_reward:.2f}, win rate = {win_rate:.2f}, ELO = {current_elo:.2f}")
+                wandb.log({
+                    "evaluation_avg_reward": avg_eval_reward,
+                    "evaluation_win_rate": win_rate,
+                    "elo_rating": current_elo,
+                    "episode": episode_count
+                })
+                # Save periodic checkpoints including training state
+                if episode_count % 10000 == 0:
+                    checkpoint_path = f"muzero_model_episode_{episode_count}.pth"
+                    torch.save(agent.net.state_dict(), checkpoint_path)
+                    state_checkpoint = {
+                        'episode_count': episode_count,
+                        'agent_state_dict': agent.net.state_dict()
+                    }
+                    torch.save(state_checkpoint, "muzero_resume.pth")
+                    logger.info(f"Model saved to '{checkpoint_path}' and training state saved to 'muzero_resume.pth'.")
+                    wandb.save(checkpoint_path)
+
     torch.save(agent.net.state_dict(), "muzero_model_final.pth")
     logger.info("Final model saved to 'muzero_model_final.pth'.")
     wandb.save("muzero_model_final.pth")
     wandb.finish()
+    pool.close()
+    pool.join()
 
 if __name__ == "__main__":
-    main()
+    mp.set_start_method("spawn", force=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true", help="Resume training from a saved checkpoint")
+    parser.add_argument("--resume_file", type=str, default="muzero_resume.pth", help="Path to the resume checkpoint file")
+    args = parser.parse_args()
+    wandb.init(project="muzero_go", config={
+        "board_size": config.board_size,
+        "latent_dim": config.latent_dim,
+        "learning_rate": config.learning_rate,
+        "mcts_simulations": config.mcts_simulations,
+        "num_episodes": config.num_episodes,
+        "batch_size": config.batch_size,
+        "unroll_steps": config.unroll_steps,
+        "discount": config.discount,
+        "dirichlet_epsilon": config.dirichlet_epsilon,
+        "dirichlet_alpha": config.dirichlet_alpha,
+        "initial_elo": config.initial_elo,
+        "elo_k": config.elo_k
+    })
+    main(args.resume, args.resume_file)
