@@ -10,7 +10,12 @@ import random
 from collections import deque
 import matplotlib.pyplot as plt
 import logging
-import wandb  # Import wandb for logging
+import wandb
+import warnings
+
+# --- Suppress gym warnings ---
+warnings.filterwarnings("ignore", category=UserWarning, module="gym.utils.passive_env_checker")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="gym.utils.passive_env_checker")
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO,
@@ -19,11 +24,11 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration & Hyperparameters ---
 class Config:
-    board_size = 6
-    latent_dim = 32
+    board_size = 9
+    latent_dim = 64
     learning_rate = 5e-4
     mcts_simulations = 64
-    num_episodes = 100000
+    num_episodes = 1000000
     replay_buffer_size = 10000
     batch_size = 128
     unroll_steps = 10
@@ -352,11 +357,22 @@ class Evaluator:
         with torch.no_grad():
             for _ in range(self.num_eval_episodes):
                 obs = self.env.reset()
+                # Handle tuple return from reset if needed
+                if isinstance(obs, tuple):
+                    obs = obs[0]
                 done = False
                 total_reward = 0
                 while not done:
                     action, _ = self.agent.select_action(obs)
-                    obs, reward, done, _ = self.env.step(action)
+                    result = self.env.step(action)
+                    # Handle possible new API with truncated flag
+                    if len(result) == 5:
+                        obs, reward, done, truncated, info = result
+                        done = done or truncated
+                    else:
+                        obs, reward, done, info = result
+                    if isinstance(obs, tuple):
+                        obs = obs[0]
                     total_reward += reward
                 total_rewards.append(total_reward)
                 if total_reward > 0:
@@ -395,6 +411,9 @@ def main():
 
     for episode in range(num_episodes):
         obs = env.reset()
+        # If reset returns (obs, info), extract obs
+        if isinstance(obs, tuple):
+            obs = obs[0]
         done = False
         total_reward = 0
         trajectory = {
@@ -408,7 +427,16 @@ def main():
             action, policy = agent.select_action(obs)
             trajectory['actions'].append(action)
             trajectory['policies'].append(policy)
-            obs, reward, done, info = env.step(action)
+            result = env.step(action)
+            # Handle new API (with truncated flag) if present
+            if len(result) == 5:
+                obs, reward, done, truncated, info = result
+                done = done or truncated
+            else:
+                obs, reward, done, info = result
+            # If observation comes as a tuple, extract it
+            if isinstance(obs, tuple):
+                obs = obs[0]
             trajectory['rewards'].append(reward)
             trajectory['observations'].append(obs)
             total_reward += reward
