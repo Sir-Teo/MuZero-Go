@@ -9,6 +9,13 @@ import numpy as np
 import random
 from collections import deque
 import matplotlib.pyplot as plt
+import logging
+import wandb  # Import wandb for logging
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- Configuration & Hyperparameters ---
 class Config:
@@ -16,7 +23,7 @@ class Config:
     latent_dim = 32
     learning_rate = 5e-4
     mcts_simulations = 64
-    num_episodes = 1500
+    num_episodes = 100000
     replay_buffer_size = 10000
     batch_size = 128
     unroll_steps = 10
@@ -27,8 +34,28 @@ class Config:
     # New parameters for exploration noise:
     dirichlet_epsilon = 0.25
     dirichlet_alpha = 0.03
+    # ELO update parameters:
+    initial_elo = 1000
+    elo_k = 32
+    evaluation_interval = 50
 
 config = Config()
+
+# Initialize wandb
+wandb.init(project="muzero_go", config={
+    "board_size": config.board_size,
+    "latent_dim": config.latent_dim,
+    "learning_rate": config.learning_rate,
+    "mcts_simulations": config.mcts_simulations,
+    "num_episodes": config.num_episodes,
+    "batch_size": config.batch_size,
+    "unroll_steps": config.unroll_steps,
+    "discount": config.discount,
+    "dirichlet_epsilon": config.dirichlet_epsilon,
+    "dirichlet_alpha": config.dirichlet_alpha,
+    "initial_elo": config.initial_elo,
+    "elo_k": config.elo_k
+})
 
 # Set device to GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -191,36 +218,36 @@ class MuZeroAgent:
         self.optimizer = optim.Adam(self.net.parameters(), lr=config.learning_rate)
 
     def select_action(self, observation):
-      # Extract invalid move mask from observation
-      invalid_moves = observation[govars.INVD_CHNL]
-      valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-      # Append validity for the pass move
-      valid_mask = np.concatenate([valid_mask, np.array([1.0])])
-      # If board moves exist, penalize pass move slightly:
-      if valid_mask[:-1].sum() > 0:
-          valid_mask[-1] *= 0.9
+        # Extract invalid move mask from observation
+        invalid_moves = observation[govars.INVD_CHNL]
+        valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
+        # Append validity for the pass move
+        valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+        # If board moves exist, penalize pass move slightly:
+        if valid_mask[:-1].sum() > 0:
+            valid_mask[-1] *= 0.9
 
-      mcts = MCTS(self.net, self.action_size, self.mcts_simulations)
-      root = mcts.run(observation)
+        mcts = MCTS(self.net, self.action_size, self.mcts_simulations)
+        root = mcts.run(observation)
 
-      visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0
-                                for a, child in root.children.items()])
-      
-      # Check if there are any visits for valid moves
-      if visit_counts.sum() > 0:
-          best_action = int(np.argmax(visit_counts))
-      else:
-          valid_actions = [a for a, valid in enumerate(valid_mask) if valid > 0]
-          best_action = random.choice(valid_actions)
-      
-      # (Optional) Build policy target for training purposes
-      if visit_counts.sum() > 0:
-          policy_target = visit_counts / visit_counts.sum()
-      else:
-          policy_target = np.zeros_like(visit_counts)
-          policy_target[best_action] = 1.0
+        visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0
+                                  for a, child in root.children.items()])
 
-      return best_action, policy_target
+        # Check if there are any visits for valid moves
+        if visit_counts.sum() > 0:
+            best_action = int(np.argmax(visit_counts))
+        else:
+            valid_actions = [a for a, valid in enumerate(valid_mask) if valid > 0]
+            best_action = random.choice(valid_actions)
+
+        # (Optional) Build policy target for training purposes
+        if visit_counts.sum() > 0:
+            policy_target = visit_counts / visit_counts.sum()
+        else:
+            policy_target = np.zeros_like(visit_counts)
+            policy_target[best_action] = 1.0
+
+        return best_action, policy_target
 
     def train(self, replay_buffer, batch_size):
         if len(replay_buffer) < batch_size:
@@ -306,7 +333,7 @@ class MuZeroAgent:
             target += discount_factor * value.item()
         return target
 
-# --- Evaluation System ---
+# --- Evaluation System with ELO Rating ---
 class Evaluator:
     def __init__(self, agent, env, num_eval_episodes=5):
         self.agent = agent
@@ -315,6 +342,8 @@ class Evaluator:
         self.episodes = []
         self.avg_rewards = []
         self.win_rates = []
+        self.elo_ratings = []
+        self.elo_rating = config.initial_elo  # starting ELO rating
 
     def evaluate(self, episode):
         total_rewards = []
@@ -335,12 +364,19 @@ class Evaluator:
         self.agent.net.train()
         avg_reward = np.mean(total_rewards)
         win_rate = wins / self.num_eval_episodes
+
+        # Update ELO rating against a fixed opponent rating (assumed 1000)
+        opponent_rating = 1000
+        expected = 1 / (1 + 10 ** ((opponent_rating - self.elo_rating) / 400))
+        self.elo_rating = self.elo_rating + config.elo_k * (win_rate - expected)
+
         self.episodes.append(episode)
         self.avg_rewards.append(avg_reward)
         self.win_rates.append(win_rate)
-        return avg_reward, win_rate
+        self.elo_ratings.append(self.elo_rating)
+        return avg_reward, win_rate, self.elo_rating
 
-# --- Main Training Loop with Trajectory Replay & Plotting ---
+# --- Main Training Loop with Trajectory Replay, Periodic Model Saving, Wandb Logging & Plotting ---
 def main():
     board_size = config.board_size
     env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
@@ -349,7 +385,7 @@ def main():
     num_episodes = config.num_episodes
 
     replay_buffer = deque(maxlen=config.replay_buffer_size)
-    evaluation_interval = 50
+    evaluation_interval = config.evaluation_interval
 
     training_rewards = []
     loss_episodes = []
@@ -379,44 +415,66 @@ def main():
 
         replay_buffer.append(trajectory)
         training_rewards.append(total_reward)
-        print(f"Episode {episode} total reward: {total_reward}")
+        logger.info(f"Episode {episode} total reward: {total_reward}")
+        wandb.log({"training_reward": total_reward, "episode": episode})
 
         loss = agent.train(replay_buffer, batch_size=config.batch_size)
         if loss is not None:
             loss_episodes.append(episode)
             loss_values.append(loss)
-            print(f"Episode {episode} training loss: {loss:.4f}")
+            logger.info(f"Episode {episode} training loss: {loss:.4f}")
+            wandb.log({"training_loss": loss, "episode": episode})
 
         if episode > 0 and episode % evaluation_interval == 0:
-            avg_eval_reward, win_rate = evaluator.evaluate(episode)
-            print(f"Evaluation after episode {episode}: average reward = {avg_eval_reward:.2f}, win rate = {win_rate:.2f}")
+            avg_eval_reward, win_rate, current_elo = evaluator.evaluate(episode)
+            logger.info(f"Evaluation after episode {episode}: average reward = {avg_eval_reward:.2f}, win rate = {win_rate:.2f}, ELO = {current_elo:.2f}")
+            wandb.log({
+                "evaluation_avg_reward": avg_eval_reward,
+                "evaluation_win_rate": win_rate,
+                "elo_rating": current_elo,
+                "episode": episode
+            })
+            # Periodically save the model
+            torch.save(agent.net.state_dict(), f"muzero_model_episode_{episode}.pth")
+            logger.info(f"Model saved to 'muzero_model_episode_{episode}.pth'.")
+            wandb.save(f"muzero_model_episode_{episode}.pth")
 
     # --- Plotting the Metrics ---
     plt.figure(figsize=(15, 12))
-    plt.subplot(3, 1, 1)
+    plt.subplot(4, 1, 1)
     plt.plot(training_rewards, label="Training Reward")
     plt.xlabel("Episode")
     plt.ylabel("Reward")
     plt.title("Training Reward per Episode")
     plt.legend()
-    plt.subplot(3, 1, 2)
+    plt.subplot(4, 1, 2)
     plt.plot(evaluator.episodes, evaluator.avg_rewards, 'o-', color='orange', label="Evaluation Average Reward")
     plt.xlabel("Episode")
     plt.ylabel("Average Reward")
     plt.title("Evaluation Average Reward over Time")
     plt.legend()
-    plt.subplot(3, 1, 3)
+    plt.subplot(4, 1, 3)
     plt.plot(loss_episodes, loss_values, 'o-', color='green', label="Training Loss")
     plt.xlabel("Episode")
     plt.ylabel("Loss")
     plt.title("Training Loss over Time")
     plt.legend()
+    plt.subplot(4, 1, 4)
+    plt.plot(evaluator.episodes, evaluator.elo_ratings, 'o-', color='purple', label="ELO Rating")
+    plt.xlabel("Episode")
+    plt.ylabel("ELO Rating")
+    plt.title("ELO Rating over Time")
+    plt.legend()
     plt.tight_layout()
-    plt.show()
+    plt.savefig('training_evaluation_plot.png', dpi=300, bbox_inches='tight')
+    logger.info("Plots saved to 'training_evaluation_plot.png'.")
+    wandb.log({"training_evaluation_plot": wandb.Image('training_evaluation_plot.png')})
 
-    # --- Save the trained model ---
-    torch.save(agent.net.state_dict(), "muzero_model.pth")
-    print("Model saved to 'muzero_model.pth'.")
+    # --- Save the final trained model ---
+    torch.save(agent.net.state_dict(), "muzero_model_final.pth")
+    logger.info("Final model saved to 'muzero_model_final.pth'.")
+    wandb.save("muzero_model_final.pth")
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
