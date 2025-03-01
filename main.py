@@ -25,22 +25,24 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration & Hyperparameters ---
 class Config:
-    max_board_size = 19  # Maximum supported board size
-    board_size = 19      # Current training board size (can vary up to max)
-    max_action_size = max_board_size * max_board_size + 1  # 362 for 19x19
-    latent_dim = 32
+    # max_board_size is the board size used during training (and defines maximum action space)
+    max_board_size = 9 
+    board_size = 6  # default training board size
+    latent_dim = 16
     learning_rate = 5e-4
-    mcts_simulations = 32
+    mcts_simulations = 16
     num_episodes = 50000
-    replay_buffer_size = 50000
-    batch_size = 128
+    replay_buffer_size = 5000
+    batch_size = 64
     unroll_steps = 10
     discount = 0.99
     value_loss_weight = 1.0
     policy_loss_weight = 1.0
     reward_loss_weight = 1.0
+    # Exploration noise parameters:
     dirichlet_epsilon = 0.25
     dirichlet_alpha = 0.03
+    # ELO update parameters:
     initial_elo = 1000
     elo_k = 32
     evaluation_interval = 50
@@ -51,108 +53,86 @@ config = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Network Modules ---
-
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        residual = x
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
-        x = x + residual  # Residual connection
-        return self.relu(x)
-
+# Modified RepresentationNetwork (removed board_size dependency)
 class RepresentationNetwork(nn.Module):
     def __init__(self, latent_dim):
         super(RepresentationNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(6, 32, kernel_size=3, padding=1)  # Input: 6 channels (e.g., Go state)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.res_block1 = ResidualBlock(32)
+        self.conv1 = nn.Conv2d(6, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, latent_dim, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(latent_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.res_block1(x)
-        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
         return x
 
+# Modified DynamicsNetwork: use conv + global pooling for reward and a fixed-size action embedding.
 class DynamicsNetwork(nn.Module):
     def __init__(self, latent_dim, max_action_size):
         super(DynamicsNetwork, self).__init__()
+        # Use a fixed max_action_size (e.g. for 19x19: 19*19+1 = 362) for the embedding.
         self.action_embedding = nn.Embedding(max_action_size, latent_dim)
         self.conv = nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1)
-        self.fc_reward = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+        # Instead of a board_size-dependent FC layer, use a 1x1 conv + global average pooling.
+        self.reward_conv = nn.Conv2d(latent_dim, 1, kernel_size=1)
+        self.fc_reward = nn.Linear(1, 1)
         self.relu = nn.ReLU()
 
     def forward(self, latent, action):
-        batch_size = latent.size(0)
-        action_emb = self.action_embedding(action)  # (batch_size, latent_dim)
+        batch_size = latent.shape[0]
+        action_emb = self.action_embedding(action)  # action index should be < max_action_size
         action_emb = action_emb.view(batch_size, latent.shape[1], 1, 1).expand_as(latent)
         x = latent + action_emb
-        next_latent = self.relu(self.conv(x))  # (batch_size, latent_dim, board_size, board_size)
-        pooled = next_latent.mean(dim=[2, 3])  # (batch_size, latent_dim)
-        reward = self.fc_reward(pooled)        # (batch_size, 1)
-        return next_latent, reward
+        x = self.relu(self.conv(x))
+        reward_map = self.reward_conv(x)  # shape: (B, 1, H, W)
+        # Global average pooling to obtain a board-size–independent scalar.
+        reward = reward_map.mean(dim=[2,3])  # shape: (B, 1)
+        reward = self.fc_reward(reward)
+        return x, reward
 
+# Modified PredictionNetwork: use conv heads and global pooling so output dims depend on the input spatial size.
 class PredictionNetwork(nn.Module):
     def __init__(self, latent_dim):
         super(PredictionNetwork, self).__init__()
-        self.conv_policy = nn.Conv2d(latent_dim, 1, kernel_size=1)  # Spatial logits
-        self.fc_pass = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-        self.fc_value = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+        # Value head: 1x1 conv then global average pooling and a FC layer.
+        self.value_conv = nn.Conv2d(latent_dim, 1, kernel_size=1)
+        self.value_fc = nn.Linear(1, 1)
+        # Policy head: 1x1 conv producing a map for board moves.
+        self.policy_conv = nn.Conv2d(latent_dim, 1, kernel_size=1)
+        # A separate parameter for the pass move logit.
+        self.pass_logit = nn.Parameter(torch.zeros(1))
 
     def forward(self, latent):
-        spatial_logits = self.conv_policy(latent)  # (batch_size, 1, board_size, board_size)
-        pooled = latent.mean(dim=[2, 3])           # (batch_size, latent_dim)
-        pass_logit = self.fc_pass(pooled)          # (batch_size, 1)
-        value = self.fc_value(pooled)              # (batch_size, 1)
-        return value, spatial_logits, pass_logit
+        # Value head:
+        value_map = self.value_conv(latent)  # (B, 1, H, W)
+        value = value_map.mean(dim=[2,3])      # (B, 1)
+        value = self.value_fc(value)           # (B, 1)
 
+        # Policy head:
+        policy_map = self.policy_conv(latent)  # (B, 1, H, W)
+        batch_size = policy_map.size(0)
+        board_policy = policy_map.view(batch_size, -1)  # (B, H*W)
+        # Append the pass move logit.
+        pass_logit = self.pass_logit.expand(batch_size, 1)
+        policy_logits = torch.cat([board_policy, pass_logit], dim=1)  # (B, H*W + 1)
+        return value, policy_logits
+
+# Modified MuZeroNet that no longer depends on board_size.
 class MuZeroNet(nn.Module):
     def __init__(self, latent_dim, max_action_size):
         super(MuZeroNet, self).__init__()
-        self.latent_dim = latent_dim
-        self.max_action_size = max_action_size
         self.representation = RepresentationNetwork(latent_dim)
         self.dynamics = DynamicsNetwork(latent_dim, max_action_size)
         self.prediction = PredictionNetwork(latent_dim)
 
-    def get_policy_logits(self, spatial_logits, pass_logit, board_size):
-        batch_size = spatial_logits.size(0)
-        spatial_flat = spatial_logits.view(batch_size, board_size * board_size)
-        policy_logits = torch.cat([spatial_flat, pass_logit], dim=1)
-        return policy_logits
-
-    def initial_inference(self, observation, board_size):
+    def initial_inference(self, observation):
         latent = self.representation(observation)
-        value, spatial_logits, pass_logit = self.prediction(latent)
-        policy_logits = self.get_policy_logits(spatial_logits, pass_logit, board_size)
+        value, policy_logits = self.prediction(latent)
         return latent, value, policy_logits
 
-    def recurrent_inference(self, latent, action, board_size):
+    def recurrent_inference(self, latent, action):
         next_latent, reward = self.dynamics(latent, action)
-        value, spatial_logits, pass_logit = self.prediction(next_latent)
-        policy_logits = self.get_policy_logits(spatial_logits, pass_logit, board_size)
+        value, policy_logits = self.prediction(next_latent)
         return next_latent, reward, value, policy_logits
 
 # --- MCTS with Invalid Move Masking & Dirichlet Noise ---
@@ -168,22 +148,22 @@ class MCTSNode:
         return self.value_sum / self.visit_count if self.visit_count > 0 else 0
 
 class MCTS:
-    def __init__(self, muzero_net, board_size, num_simulations, c_puct=1.0):
+    def __init__(self, muzero_net, action_size, num_simulations, c_puct=1.0):
         self.net = muzero_net
-        self.board_size = board_size
-        self.action_size = board_size * board_size + 1
+        self.action_size = action_size  # expected to match the legal moves for the current board
         self.num_simulations = num_simulations
         self.c_puct = c_puct
 
     def run(self, observation):
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(device)
-        latent, value, policy_logits = self.net.initial_inference(obs_tensor, self.board_size)
+        latent, value, policy_logits = self.net.initial_inference(obs_tensor)
         policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
 
         # Extract invalid move mask from observation
         invalid_moves = observation[govars.INVD_CHNL]
         valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-        valid_mask = np.concatenate([valid_mask, np.array([1.0])])  # Append pass move
+        # Append validity for the pass move (always valid)
+        valid_mask = np.concatenate([valid_mask, np.array([1.0])])
 
         if valid_mask[:-1].sum() > 0:
             valid_mask[-1] *= 0.9
@@ -222,8 +202,7 @@ class MCTS:
         selected = node.children[best_action]
         if selected['node'] is None:
             action_tensor = torch.LongTensor([best_action]).to(device)
-            next_latent, reward, value, policy_logits = self.net.recurrent_inference(
-                node.latent, action_tensor, self.board_size)
+            next_latent, reward, value, policy_logits = self.net.recurrent_inference(node.latent, action_tensor)
             policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
             child_node = MCTSNode(next_latent, 0)
             for a in range(self.action_size):
@@ -239,11 +218,14 @@ class MCTS:
             selected['value_sum'] += value_estimate
             return value_estimate
 
-# --- MuZero Agent ---
+# --- MuZero Agent with Fixed Target Value Calculation ---
+# Modified MuZeroAgent: instantiate the network with a fixed max_action_size so that the weights are independent of board size.
 class MuZeroAgent:
-    def __init__(self, board_size, latent_dim, max_action_size, num_simulations):
-        self.board_size = board_size
-        self.action_size = board_size * board_size + 1
+    def __init__(self, board_size, latent_dim, env_action_size, num_simulations):
+        self.board_size = board_size  # training board size (usually the maximum)
+        self.action_size = env_action_size  # typically board_size^2 + 1 for the training env
+        # Use fixed max_action_size based on the max_board_size in config (e.g. 19x19+1)
+        max_action_size = config.max_board_size * config.max_board_size + 1
         self.net = MuZeroNet(latent_dim, max_action_size).to(device)
         self.mcts_simulations = num_simulations
         self.optimizer = optim.Adam(self.net.parameters(), lr=config.learning_rate)
@@ -255,10 +237,10 @@ class MuZeroAgent:
         if valid_mask[:-1].sum() > 0:
             valid_mask[-1] *= 0.9
 
-        mcts = MCTS(self.net, self.board_size, self.mcts_simulations)
+        mcts = MCTS(self.net, self.action_size, self.mcts_simulations)
         root = mcts.run(observation)
         visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0
-                                 for a, child in root.children.items()])
+                                  for a, child in root.children.items()])
 
         if visit_counts.sum() > 0:
             best_action = int(np.argmax(visit_counts))
@@ -285,11 +267,14 @@ class MuZeroAgent:
             start_index = random.randint(0, traj_length)
             initial_obs = trajectory['observations'][start_index]
             initial_obs_tensor = torch.FloatTensor(initial_obs).unsqueeze(0).to(device)
-            latent, value, policy_logits = self.net.initial_inference(initial_obs_tensor, self.board_size)
+            latent, value, policy_logits = self.net.initial_inference(initial_obs_tensor)
 
             losses = 0
             target_value = self.compute_target_value(trajectory, start_index, config.unroll_steps)
-            target_policy = trajectory['policies'][start_index] if start_index < len(trajectory['policies']) else np.ones(self.action_size) / self.action_size
+            if start_index < len(trajectory['policies']):
+                target_policy = trajectory['policies'][start_index]
+            else:
+                target_policy = np.ones(self.action_size) / self.action_size
 
             target_value_tensor = torch.FloatTensor([target_value]).to(device)
             target_policy_tensor = torch.FloatTensor([target_policy]).to(device)
@@ -302,12 +287,22 @@ class MuZeroAgent:
 
             current_latent = latent
             for k in range(1, config.unroll_steps + 1):
-                action_idx = start_index + k - 1
-                action_tensor = torch.LongTensor([trajectory['actions'][action_idx] if action_idx < len(trajectory['actions']) else self.action_size - 1]).to(device)
-                current_latent, reward, value, policy_logits = self.net.recurrent_inference(current_latent, action_tensor, self.board_size)
+                if start_index + k - 1 < len(trajectory['actions']):
+                    action = trajectory['actions'][start_index + k - 1]
+                    action_tensor = torch.LongTensor([action]).to(device)
+                else:
+                    action_tensor = torch.LongTensor([self.action_size - 1]).to(device)
 
-                target_reward = trajectory['rewards'][action_idx] if action_idx < len(trajectory['rewards']) else 0.0
-                target_policy = trajectory['policies'][start_index + k] if start_index + k < len(trajectory['policies']) else np.ones(self.action_size) / self.action_size
+                current_latent, reward, value, policy_logits = self.net.recurrent_inference(current_latent, action_tensor)
+
+                if start_index + k - 1 < len(trajectory['rewards']):
+                    target_reward = trajectory['rewards'][start_index + k - 1]
+                else:
+                    target_reward = 0.0
+                if start_index + k < len(trajectory['policies']):
+                    target_policy = trajectory['policies'][start_index + k]
+                else:
+                    target_policy = np.ones(self.action_size) / self.action_size
                 target_value = self.compute_target_value(trajectory, start_index + k, config.unroll_steps)
 
                 target_reward_tensor = torch.FloatTensor([target_reward]).to(device)
@@ -341,7 +336,7 @@ class MuZeroAgent:
             obs = trajectory['observations'][index + unroll_steps]
             obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)
             with torch.no_grad():
-                _, value, _ = self.net.initial_inference(obs_tensor, self.board_size)
+                _, value, _ = self.net.initial_inference(obs_tensor)
             target += discount_factor * value.item()
         return target
 
@@ -398,8 +393,10 @@ class Evaluator:
 
 # --- Worker Function for Parallel Self-play ---
 def simulate_episode(args):
-    agent_state_dict, board_size, latent_dim, max_action_size, num_simulations = args
-    local_agent = MuZeroAgent(board_size, latent_dim, max_action_size, num_simulations)
+    # This worker does not initialize wandb, avoiding duplicate logins.
+    agent_state_dict, board_size, latent_dim, env_action_size, num_simulations = args
+    # Create a local agent using the same max_action_size as during training.
+    local_agent = MuZeroAgent(board_size, latent_dim, env_action_size, num_simulations)
     local_agent.net.load_state_dict(agent_state_dict)
     env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
     obs = env.reset()
@@ -431,15 +428,16 @@ def simulate_episode(args):
         total_reward += reward
     return trajectory, total_reward
 
-# --- Main Training Loop ---
+# --- Main Training Loop with Multiprocessing ---
 def main():
     board_size = config.board_size
     env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
-    agent = MuZeroAgent(board_size, config.latent_dim, config.max_action_size, config.mcts_simulations)
+    env_action_size = env.action_space.n  # should equal board_size^2+1 for training env
+    agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, num_simulations=config.mcts_simulations)
     num_episodes = config.num_episodes
     replay_buffer = deque(maxlen=config.replay_buffer_size)
     evaluation_interval = config.evaluation_interval
-    evaluator = Evaluator(agent, env)
+    evaluator = Evaluator(agent, env, num_eval_episodes=5)
 
     num_workers = 8
     pool = Pool(processes=num_workers)
@@ -447,7 +445,7 @@ def main():
 
     while episode_count < num_episodes:
         current_state = agent.net.state_dict()
-        worker_args = [(current_state, board_size, config.latent_dim, config.max_action_size, config.mcts_simulations)
+        worker_args = [(current_state, config.board_size, config.latent_dim, env_action_size, config.mcts_simulations)
                        for _ in range(num_workers)]
         results = pool.map(simulate_episode, worker_args)
         for trajectory, total_reward in results:
@@ -484,9 +482,9 @@ def main():
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
-    wandb.init(project="muzero_go", config={
-        "board_size": config.board_size,
+    wandb.init(project="muzero_go_uni", config={
         "max_board_size": config.max_board_size,
+        "board_size": config.board_size,
         "latent_dim": config.latent_dim,
         "learning_rate": config.learning_rate,
         "mcts_simulations": config.mcts_simulations,
