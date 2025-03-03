@@ -26,12 +26,12 @@ logger = logging.getLogger(__name__)
 # --- Configuration & Hyperparameters ---
 class Config:
     # max_board_size is the board size used during training (and defines maximum action space)
-    max_board_size = 9 
-    board_size = 6  # default training board size
+    max_board_size = 19 
+    board_size = 19  # default training board size
     latent_dim = 16
     learning_rate = 5e-4
     mcts_simulations = 16
-    num_episodes = 50000
+    num_episodes = 300000
     replay_buffer_size = 5000
     batch_size = 64
     unroll_steps = 10
@@ -70,25 +70,28 @@ class RepresentationNetwork(nn.Module):
 class DynamicsNetwork(nn.Module):
     def __init__(self, latent_dim, max_action_size):
         super(DynamicsNetwork, self).__init__()
-        # Use a fixed max_action_size (e.g. for 19x19: 19*19+1 = 362) for the embedding.
         self.action_embedding = nn.Embedding(max_action_size, latent_dim)
         self.conv = nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1)
-        # Instead of a board_size-dependent FC layer, use a 1x1 conv + global average pooling.
+        # Reward branch: add an extra fully-connected hidden layer
         self.reward_conv = nn.Conv2d(latent_dim, 1, kernel_size=1)
-        self.fc_reward = nn.Linear(1, 1)
+        self.fc_reward_hidden = nn.Linear(1, 16)
+        self.fc_reward_output = nn.Linear(16, 1)
         self.relu = nn.ReLU()
 
     def forward(self, latent, action):
         batch_size = latent.shape[0]
-        action_emb = self.action_embedding(action)  # action index should be < max_action_size
+        action_emb = self.action_embedding(action)
         action_emb = action_emb.view(batch_size, latent.shape[1], 1, 1).expand_as(latent)
         x = latent + action_emb
         x = self.relu(self.conv(x))
-        reward_map = self.reward_conv(x)  # shape: (B, 1, H, W)
-        # Global average pooling to obtain a board-size–independent scalar.
-        reward = reward_map.mean(dim=[2,3])  # shape: (B, 1)
-        reward = self.fc_reward(reward)
+        reward_map = self.reward_conv(x)  
+        # Global average pooling
+        reward = reward_map.mean(dim=[2, 3])
+        # Use a hidden layer before outputting the reward
+        reward = self.relu(self.fc_reward_hidden(reward))
+        reward = self.fc_reward_output(reward)
         return x, reward
+
 
 # Modified PredictionNetwork: use conv heads and global pooling so output dims depend on the input spatial size.
 class PredictionNetwork(nn.Module):
@@ -137,34 +140,34 @@ class MuZeroNet(nn.Module):
 
 # --- MCTS with Invalid Move Masking & Dirichlet Noise ---
 class MCTSNode:
-    def __init__(self, latent, prior):
+    def __init__(self, latent, prior, terminal=False):
         self.latent = latent
         self.prior = prior
         self.visit_count = 0
         self.value_sum = 0
         self.children = {}
+        self.terminal = terminal  # Flag to indicate if the state is terminal
 
     def value(self):
         return self.value_sum / self.visit_count if self.visit_count > 0 else 0
 
 class MCTS:
-    def __init__(self, muzero_net, action_size, num_simulations, c_puct=1.0):
+    def __init__(self, muzero_net, action_size, num_simulations, c_puct=1.0, virtual_loss=1):
         self.net = muzero_net
-        self.action_size = action_size  # expected to match the legal moves for the current board
+        self.action_size = action_size  # Should match the legal move space (board moves + pass)
         self.num_simulations = num_simulations
         self.c_puct = c_puct
+        self.virtual_loss = virtual_loss
 
     def run(self, observation):
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(device)
         latent, value, policy_logits = self.net.initial_inference(obs_tensor)
         policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
 
-        # Extract invalid move mask from observation
+        # Apply invalid move masking and Dirichlet noise as before.
         invalid_moves = observation[govars.INVD_CHNL]
         valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-        # Append validity for the pass move (always valid)
         valid_mask = np.concatenate([valid_mask, np.array([1.0])])
-
         if valid_mask[:-1].sum() > 0:
             valid_mask[-1] *= 0.9
 
@@ -174,46 +177,74 @@ class MCTS:
         else:
             masked_policy = valid_mask / valid_mask.sum()
 
-        # Add Dirichlet noise to the root prior
         noise = np.random.dirichlet([config.dirichlet_alpha] * len(masked_policy))
         masked_policy = (1 - config.dirichlet_epsilon) * masked_policy + config.dirichlet_epsilon * noise
 
-        root = MCTSNode(latent, 0)
+        # Initialize the root node.
+        root = MCTSNode(latent, prior=0)
         for a in range(self.action_size):
-            root.children[a] = {'node': None, 'prior': masked_policy[a],
-                                'action': a, 'visit_count': 0, 'value_sum': 0}
+            root.children[a] = {
+                'node': None,
+                'prior': masked_policy[a],
+                'action': a,
+                'visit_count': 0,
+                'value_sum': 0
+            }
+        # Run the simulations.
         for _ in range(self.num_simulations):
             self.simulate(root)
         return root
 
     def simulate(self, node):
+        # If the node is terminal, stop recursion.
+        if node.terminal:
+            return 0
+
         best_score = -float('inf')
         best_action = None
+
+        # Improved UCB calculation: Q + U.
         for action, child in node.children.items():
-            if child['visit_count'] == 0:
-                ucb = self.c_puct * child['prior']
-            else:
-                ucb = (child['value_sum'] / child['visit_count'] +
-                       self.c_puct * child['prior'] * np.sqrt(node.visit_count + 1) / (1 + child['visit_count']))
-            if ucb > best_score:
-                best_score = ucb
+            Q = child['value_sum'] / child['visit_count'] if child['visit_count'] > 0 else 0
+            U = self.c_puct * child['prior'] * np.sqrt(node.visit_count + 1) / (1 + child['visit_count'])
+            score = Q + U
+            if score > best_score:
+                best_score = score
                 best_action = action
 
         selected = node.children[best_action]
+
+        # Apply virtual loss before descending.
+        selected['visit_count'] += self.virtual_loss
+
         if selected['node'] is None:
+            # Expand the node.
             action_tensor = torch.LongTensor([best_action]).to(device)
             next_latent, reward, value, policy_logits = self.net.recurrent_inference(node.latent, action_tensor)
+            # Determine terminal status based on reward (or any other environment-specific condition)
+            is_terminal = (reward.item() != 0)  # Customize this check as needed.
+            child_node = MCTSNode(next_latent, prior=0, terminal=is_terminal)
             policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
-            child_node = MCTSNode(next_latent, 0)
             for a in range(self.action_size):
-                child_node.children[a] = {'node': None, 'prior': policy[a],
-                                          'action': a, 'visit_count': 0, 'value_sum': 0}
+                child_node.children[a] = {
+                    'node': None,
+                    'prior': policy[a],
+                    'action': a,
+                    'visit_count': 0,
+                    'value_sum': 0
+                }
             selected['node'] = child_node
+
+            # Remove the virtual loss and update the node.
+            selected['visit_count'] -= self.virtual_loss
             selected['visit_count'] += 1
             selected['value_sum'] += value.item()
             return value.item()
         else:
+            # Continue simulation down the tree.
             value_estimate = self.simulate(selected['node'])
+            # Remove the virtual loss and update.
+            selected['visit_count'] -= self.virtual_loss
             selected['visit_count'] += 1
             selected['value_sum'] += value_estimate
             return value_estimate

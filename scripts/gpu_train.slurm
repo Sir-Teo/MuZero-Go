@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p a100_long,a100_short
+#SBATCH -p a100_short,radiology
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

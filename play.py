@@ -233,7 +233,7 @@ def main():
     agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
     
     # Load weight file from command-line argument (or default) 
-    weight_file = sys.argv[1] if len(sys.argv) > 1 else "muzero_model_episode_30000.pth"
+    weight_file = sys.argv[1] if len(sys.argv) > 1 else "muzero_model_final.pth"
     try:
         state_dict = torch.load(weight_file, map_location=device)
         agent.net.load_state_dict(state_dict)
