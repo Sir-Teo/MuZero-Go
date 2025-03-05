@@ -26,13 +26,13 @@ logger = logging.getLogger(__name__)
 # --- Configuration & Hyperparameters ---
 class Config:
     # max_board_size is the board size used during training (and defines maximum action space)
-    max_board_size = 19 
-    board_size = 19  # default training board size
+    max_board_size = 6 
+    board_size = 6  # default training board size
     latent_dim = 16
     learning_rate = 5e-4
     mcts_simulations = 16
-    num_episodes = 300000
-    replay_buffer_size = 5000
+    num_episodes = 100000
+    replay_buffer_size = 2000
     batch_size = 64
     unroll_steps = 10
     discount = 0.99
@@ -293,64 +293,65 @@ class MuZeroAgent:
         loss_total = 0
         self.optimizer.zero_grad()
         batch = random.sample(replay_buffer, batch_size)
-        for trajectory in batch:
-            traj_length = len(trajectory['actions'])
-            start_index = random.randint(0, traj_length)
-            initial_obs = trajectory['observations'][start_index]
-            initial_obs_tensor = torch.FloatTensor(initial_obs).unsqueeze(0).to(device)
-            latent, value, policy_logits = self.net.initial_inference(initial_obs_tensor)
+        scaler = torch.cuda.amp.GradScaler()
+        losses = 0
+        with torch.cuda.amp.autocast():
+            for trajectory in batch:
+                traj_length = len(trajectory['actions'])
+                start_index = random.randint(0, traj_length)
+                initial_obs = trajectory['observations'][start_index]
+                initial_obs_tensor = torch.FloatTensor(initial_obs).unsqueeze(0).to(device)
+                latent, value, policy_logits = self.net.initial_inference(initial_obs_tensor)
 
-            losses = 0
-            target_value = self.compute_target_value(trajectory, start_index, config.unroll_steps)
-            if start_index < len(trajectory['policies']):
-                target_policy = trajectory['policies'][start_index]
-            else:
-                target_policy = np.ones(self.action_size) / self.action_size
+                step_losses = 0
+                target_value = self.compute_target_value(trajectory, start_index, config.unroll_steps)
+                target_policy = trajectory['policies'][start_index] if start_index < len(trajectory['policies']) else np.ones(self.action_size) / self.action_size
+                # Ensure target_value and target_policy are NumPy arrays before conversion
+                target_value_array = np.array(target_value, dtype=np.float32)  # Convert to NumPy array
+                target_policy_array = np.array(target_policy, dtype=np.float32)  # Convert to NumPy array
 
-            target_value_tensor = torch.FloatTensor([target_value]).to(device)
-            target_policy_tensor = torch.FloatTensor([target_policy]).to(device)
+                # Convert to PyTorch tensors
+                target_value_tensor = torch.tensor(target_value_array, dtype=torch.float32, device=device)
+                target_policy_tensor = torch.tensor(target_policy_array, dtype=torch.float32, device=device)
 
-            value_loss = F.mse_loss(value.squeeze(), target_value_tensor)
-            policy_loss = F.kl_div(F.log_softmax(policy_logits, dim=1), target_policy_tensor, reduction='batchmean')
-            step_loss = (config.value_loss_weight * value_loss +
-                         config.policy_loss_weight * policy_loss)
-            losses += step_loss
 
-            current_latent = latent
-            for k in range(1, config.unroll_steps + 1):
-                if start_index + k - 1 < len(trajectory['actions']):
-                    action = trajectory['actions'][start_index + k - 1]
-                    action_tensor = torch.LongTensor([action]).to(device)
-                else:
-                    action_tensor = torch.LongTensor([self.action_size - 1]).to(device)
-
-                current_latent, reward, value, policy_logits = self.net.recurrent_inference(current_latent, action_tensor)
-
-                if start_index + k - 1 < len(trajectory['rewards']):
-                    target_reward = trajectory['rewards'][start_index + k - 1]
-                else:
-                    target_reward = 0.0
-                if start_index + k < len(trajectory['policies']):
-                    target_policy = trajectory['policies'][start_index + k]
-                else:
-                    target_policy = np.ones(self.action_size) / self.action_size
-                target_value = self.compute_target_value(trajectory, start_index + k, config.unroll_steps)
-
-                target_reward_tensor = torch.FloatTensor([target_reward]).to(device)
-                target_value_tensor = torch.FloatTensor([target_value]).to(device)
-                target_policy_tensor = torch.FloatTensor([target_policy]).to(device)
-
-                reward_loss = F.mse_loss(reward.squeeze(), target_reward_tensor)
                 value_loss = F.mse_loss(value.squeeze(), target_value_tensor)
                 policy_loss = F.kl_div(F.log_softmax(policy_logits, dim=1), target_policy_tensor, reduction='batchmean')
-                step_loss = (config.reward_loss_weight * reward_loss +
-                             config.value_loss_weight * value_loss +
-                             config.policy_loss_weight * policy_loss)
-                losses += step_loss
-            losses.backward()
-            loss_total += losses.item()
-        self.optimizer.step()
+                step_losses += (config.value_loss_weight * value_loss +
+                                config.policy_loss_weight * policy_loss)
+
+                current_latent = latent
+                for k in range(1, config.unroll_steps + 1):
+                    if start_index + k - 1 < len(trajectory['actions']):
+                        action = trajectory['actions'][start_index + k - 1]
+                        action_tensor = torch.LongTensor([action]).to(device)
+                    else:
+                        action_tensor = torch.LongTensor([self.action_size - 1]).to(device)
+
+                    current_latent, reward, value, policy_logits = self.net.recurrent_inference(current_latent, action_tensor)
+
+                    target_reward = trajectory['rewards'][start_index + k - 1] if start_index + k - 1 < len(trajectory['rewards']) else 0.0
+                    target_policy = trajectory['policies'][start_index + k] if start_index + k < len(trajectory['policies']) else np.ones(self.action_size) / self.action_size
+                    target_value = self.compute_target_value(trajectory, start_index + k, config.unroll_steps)
+
+                    target_reward_tensor = torch.FloatTensor([target_reward]).to(device)
+                    target_value_tensor = torch.FloatTensor([target_value]).to(device)
+                    target_policy_tensor = torch.FloatTensor([target_policy]).to(device)
+
+                    reward_loss = F.mse_loss(reward.squeeze(), target_reward_tensor)
+                    value_loss = F.mse_loss(value.squeeze(), target_value_tensor)
+                    policy_loss = F.kl_div(F.log_softmax(policy_logits, dim=1), target_policy_tensor, reduction='batchmean')
+                    step_losses += (config.reward_loss_weight * reward_loss +
+                                    config.value_loss_weight * value_loss +
+                                    config.policy_loss_weight * policy_loss)
+                losses += step_losses
+                loss_total += step_losses.item()
+        # Scale loss and perform backward pass
+        scaler.scale(losses).backward()
+        scaler.step(self.optimizer)
+        scaler.update()
         return loss_total / batch_size
+
 
     def compute_target_value(self, trajectory, index, unroll_steps):
         target = 0.0
@@ -424,6 +425,8 @@ class Evaluator:
 
 # --- Worker Function for Parallel Self-play ---
 def simulate_episode(args):
+    global device
+    device = torch.device("cpu")
     # This worker does not initialize wandb, avoiding duplicate logins.
     agent_state_dict, board_size, latent_dim, env_action_size, num_simulations = args
     # Create a local agent using the same max_action_size as during training.
@@ -470,7 +473,7 @@ def main():
     evaluation_interval = config.evaluation_interval
     evaluator = Evaluator(agent, env, num_eval_episodes=5)
 
-    num_workers = 8
+    num_workers = 4
     pool = Pool(processes=num_workers)
     episode_count = 0
 
