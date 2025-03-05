@@ -11,8 +11,6 @@ from collections import deque
 import logging
 import wandb
 import warnings
-from multiprocessing import Pool
-import torch.multiprocessing as mp
 
 # --- Suppress gym warnings ---
 warnings.filterwarnings("ignore", category=UserWarning, module="gym.utils.passive_env_checker")
@@ -91,7 +89,6 @@ class DynamicsNetwork(nn.Module):
         reward = self.relu(self.fc_reward_hidden(reward))
         reward = self.fc_reward_output(reward)
         return x, reward
-
 
 # Modified PredictionNetwork: use conv heads and global pooling so output dims depend on the input spatial size.
 class PredictionNetwork(nn.Module):
@@ -314,7 +311,6 @@ class MuZeroAgent:
                 target_value_tensor = torch.tensor(target_value_array, dtype=torch.float32, device=device)
                 target_policy_tensor = torch.tensor(target_policy_array, dtype=torch.float32, device=device)
 
-
                 value_loss = F.mse_loss(value.squeeze(), target_value_tensor)
                 policy_loss = F.kl_div(F.log_softmax(policy_logits, dim=1), target_policy_tensor, reduction='batchmean')
                 step_losses += (config.value_loss_weight * value_loss +
@@ -351,7 +347,6 @@ class MuZeroAgent:
         scaler.step(self.optimizer)
         scaler.update()
         return loss_total / batch_size
-
 
     def compute_target_value(self, trajectory, index, unroll_steps):
         target = 0.0
@@ -423,11 +418,9 @@ class Evaluator:
         self.elo_ratings.append(self.elo_rating)
         return avg_reward, win_rate, self.elo_rating
 
-# --- Worker Function for Parallel Self-play ---
+# --- Self-play Episode Simulation ---
 def simulate_episode(args):
-    global device
-    device = torch.device("cpu")
-    # This worker does not initialize wandb, avoiding duplicate logins.
+    # Unpack the arguments.
     agent_state_dict, board_size, latent_dim, env_action_size, num_simulations = args
     # Create a local agent using the same max_action_size as during training.
     local_agent = MuZeroAgent(board_size, latent_dim, env_action_size, num_simulations)
@@ -462,7 +455,7 @@ def simulate_episode(args):
         total_reward += reward
     return trajectory, total_reward
 
-# --- Main Training Loop with Multiprocessing ---
+# --- Main Training Loop (Sequential Self-play) ---
 def main():
     board_size = config.board_size
     env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
@@ -473,49 +466,43 @@ def main():
     evaluation_interval = config.evaluation_interval
     evaluator = Evaluator(agent, env, num_eval_episodes=5)
 
-    num_workers = 4
-    pool = Pool(processes=num_workers)
     episode_count = 0
 
     while episode_count < num_episodes:
         current_state = agent.net.state_dict()
-        worker_args = [(current_state, config.board_size, config.latent_dim, env_action_size, config.mcts_simulations)
-                       for _ in range(num_workers)]
-        results = pool.map(simulate_episode, worker_args)
-        for trajectory, total_reward in results:
-            replay_buffer.append(trajectory)
-            logger.info(f"Episode {episode_count} total reward: {total_reward}")
-            wandb.log({"training_reward": total_reward, "episode": episode_count})
-            episode_count += 1
+        # Simulate one episode sequentially.
+        args = (current_state, config.board_size, config.latent_dim, env_action_size, config.mcts_simulations)
+        trajectory, total_reward = simulate_episode(args)
+        replay_buffer.append(trajectory)
+        logger.info(f"Episode {episode_count} total reward: {total_reward}")
+        wandb.log({"training_reward": total_reward, "episode": episode_count})
+        episode_count += 1
 
-            loss = agent.train(replay_buffer, batch_size=config.batch_size)
-            if loss is not None:
-                logger.info(f"Episode {episode_count} training loss: {loss:.4f}")
-                wandb.log({"training_loss": loss, "episode": episode_count})
+        loss = agent.train(replay_buffer, batch_size=config.batch_size)
+        if loss is not None:
+            logger.info(f"Episode {episode_count} training loss: {loss:.4f}")
+            wandb.log({"training_loss": loss, "episode": episode_count})
 
-            if episode_count > 0 and episode_count % evaluation_interval == 0:
-                avg_eval_reward, win_rate, current_elo = evaluator.evaluate(episode_count)
-                logger.info(f"Evaluation after episode {episode_count}: average reward = {avg_eval_reward:.2f}, win rate = {win_rate:.2f}, ELO = {current_elo:.2f}")
-                wandb.log({
-                    "evaluation_avg_reward": avg_eval_reward,
-                    "evaluation_win_rate": win_rate,
-                    "elo_rating": current_elo,
-                    "episode": episode_count
-                })
-                if episode_count % 10000 == 0:
-                    torch.save(agent.net.state_dict(), f"muzero_model_episode_{episode_count}.pth")
-                    logger.info(f"Model saved to 'muzero_model_episode_{episode_count}.pth'.")
-                    wandb.save(f"muzero_model_episode_{episode_count}.pth")
+        if episode_count > 0 and episode_count % evaluation_interval == 0:
+            avg_eval_reward, win_rate, current_elo = evaluator.evaluate(episode_count)
+            logger.info(f"Evaluation after episode {episode_count}: average reward = {avg_eval_reward:.2f}, win rate = {win_rate:.2f}, ELO = {current_elo:.2f}")
+            wandb.log({
+                "evaluation_avg_reward": avg_eval_reward,
+                "evaluation_win_rate": win_rate,
+                "elo_rating": current_elo,
+                "episode": episode_count
+            })
+            if episode_count % 10000 == 0:
+                torch.save(agent.net.state_dict(), f"muzero_model_episode_{episode_count}.pth")
+                logger.info(f"Model saved to 'muzero_model_episode_{episode_count}.pth'.")
+                wandb.save(f"muzero_model_episode_{episode_count}.pth")
 
     torch.save(agent.net.state_dict(), "muzero_model_final.pth")
     logger.info("Final model saved to 'muzero_model_final.pth'.")
     wandb.save("muzero_model_final.pth")
     wandb.finish()
-    pool.close()
-    pool.join()
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
     wandb.init(project="muzero_go_uni", config={
         "max_board_size": config.max_board_size,
         "board_size": config.board_size,
