@@ -254,6 +254,7 @@ class BatchedMCTS:
                     all_actions.append(action)
                     expansion_indices.append((env_idx, path, action))
 
+            # Inside BatchedMCTS.run(), in the simulation loop:
             if all_latents:
                 latents_tensor = torch.stack(all_latents).to(device)
                 actions_tensor = torch.LongTensor(all_actions).to(device)
@@ -266,17 +267,18 @@ class BatchedMCTS:
                     next_latent = next_latents[idx]
                     reward = rewards[idx].item()
                     value = values[idx].item()
-                    is_terminal = (reward != 0)  # Customize as needed
+                    is_terminal = (reward != 0)  # Adjust terminal condition if needed
                     child_node = MCTSNode(next_latent, prior=0, terminal=is_terminal)
-                    backup_value = reward + config.discount * value  # incorporate immediate reward
-                    self.backpropagate(path + [child_node], backup_value)
+                    
+                    # Apply valid move mask to child policy (unchanged)
+                    next_obs = observations[env_idx]
                     invalid_moves = next_obs[govars.INVD_CHNL]
                     valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
                     valid_mask = np.concatenate([valid_mask, np.array([1.0])])
                     masked_child_policy = policy[idx] * valid_mask
                     if masked_child_policy.sum() > 0:
                         masked_child_policy /= masked_child_policy.sum()
-
+                    
                     for a in range(self.action_size):
                         child_node.children[a] = {
                             'node': None,
@@ -285,9 +287,10 @@ class BatchedMCTS:
                             'visit_count': 0,
                             'value_sum': 0
                         }
+                    # Incorporate reward into the backup value
+                    backup_value = reward + config.discount * value
                     leaf.children[action]['node'] = child_node
-                    self.backpropagate(path + [child_node], value)
-
+                    self.backpropagate(path + [child_node], backup_value)
         return self.trees
 
     def select_leaf(self, tree):
@@ -342,7 +345,7 @@ class MuZeroAgent:
         with torch.cuda.amp.autocast():  # Updated API
             for trajectory in batch:
                 traj_length = len(trajectory['actions'])
-                start_index = random.randint(0, traj_length - 1)
+                start_index = random.randint(0, traj_length - 1) 
                 initial_obs = trajectory['observations'][start_index]
                 initial_obs_tensor = torch.FloatTensor(initial_obs).unsqueeze(0).to(device)
                 latent, value, policy_logits = self.net.initial_inference(initial_obs_tensor)
@@ -463,8 +466,6 @@ class SelfPlayEvaluator:
                 obs = obs[0]
             # Alternate turn after each move
             turn = 1 - turn
-        # For this example, assume a positive reward indicates a win for current_agent
-        # You might need to adjust based on your environment's reward structure.
         return 1 if info.get('winner') == (0 if starting_player == 0 else 1) else 0
 
     def evaluate(self):
