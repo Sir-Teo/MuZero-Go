@@ -25,23 +25,23 @@ logger = logging.getLogger(__name__)
 class Config:
     max_board_size = 6  # Maximum board size (defines action space)
     board_size = 6      # Default training board size
-    latent_dim = 16
-    learning_rate = 5e-4
-    mcts_simulations = 16
+    latent_dim = 64
+    learning_rate = 1e-4
+    mcts_simulations = 50
     num_episodes = 100000
-    num_envs = 64       # Number of parallel environments
-    replay_buffer_size = 2000
+    num_envs = 32       # Number of parallel environments
+    replay_buffer_size = 10000
     batch_size = 64
-    unroll_steps = 10
+    unroll_steps = 64
     discount = 0.99
     value_loss_weight = 1.0
     policy_loss_weight = 1.0
     reward_loss_weight = 1.0
-    dirichlet_epsilon = 0.25
-    dirichlet_alpha = 0.03
+    dirichlet_epsilon = 0.02
+    dirichlet_alpha = 0.01
     initial_elo = 1000
     elo_k = 32
-    evaluation_interval = 50
+    evaluation_interval = 1
 
 config = Config()
 
@@ -52,14 +52,39 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class RepresentationNetwork(nn.Module):
     def __init__(self, latent_dim):
         super(RepresentationNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(6, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, latent_dim, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, latent_dim, kernel_size=3, padding=1)
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.relu(self.conv1(x))
         x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
         return x
+
+    def evaluate(self):
+        current_wins = 0
+        # Alternate which agent starts to balance first-move advantages
+        for i in range(self.num_games):
+            starting_player = i % 2  # Alternate starting players
+            result = self.play_game(starting_player=starting_player)
+            # If best_agent starts (turn=1), then a win (reward > 0) means best_agent won,
+            # so invert the outcome for current_agent’s perspective.
+            if starting_player == 1:
+                result = 1 - result
+            current_wins += result
+
+        win_rate = current_wins / self.num_games
+
+        # Update Elo ratings for both agents using the Elo update formula:
+        expected_score = 1 / (1 + 10 ** ((self.best_elo - self.current_elo) / 400))
+        self.current_elo += config.elo_k * (win_rate - expected_score)
+        self.best_elo += config.elo_k * ((1 - win_rate) - (1 - expected_score))
+
+        return win_rate, self.current_elo
+
+
 
 class DynamicsNetwork(nn.Module):
     def __init__(self, latent_dim, max_action_size):
@@ -311,9 +336,10 @@ class MuZeroAgent:
         loss_total = 0
         self.optimizer.zero_grad()
         batch = random.sample(replay_buffer, batch_size)
-        scaler = torch.amp.GradScaler('cuda')  # Updated API
+        scaler = torch.cuda.amp.GradScaler(init_scale=65536.0)
+
         losses = 0
-        with torch.amp.autocast('cuda'):  # Updated API
+        with torch.cuda.amp.autocast():  # Updated API
             for trajectory in batch:
                 traj_length = len(trajectory['actions'])
                 start_index = random.randint(0, traj_length)
@@ -385,70 +411,99 @@ class MuZeroAgent:
             target += discount_factor * value.item()
         return target
 
-# Evaluator
-class Evaluator:
-    def __init__(self, agent, env, num_eval_episodes=5):
-        self.agent = agent
+class SelfPlayEvaluator:
+    def __init__(self, current_agent, best_agent, env, num_games=20):
+        self.current_agent = current_agent
+        self.best_agent = best_agent  # This is a snapshot of the best model so far
         self.env = env
-        self.num_eval_episodes = num_eval_episodes
-        self.episodes = []
-        self.avg_rewards = []
-        self.win_rates = []
-        self.elo_ratings = []
-        self.elo_rating = config.initial_elo
+        self.num_games = num_games
+        # Initialize Elo ratings; both start with the same rating
+        self.current_elo = config.initial_elo
+        self.best_elo = config.initial_elo
 
-    def evaluate(self, episode):
-        total_rewards = []
-        wins = 0
-        self.agent.net.eval()
-        with torch.no_grad():
-            for _ in range(self.num_eval_episodes):
-                obs = self.env.reset()
-                if isinstance(obs, tuple):
-                    obs = obs[0]
-                done = False
-                total_reward = 0
-                while not done:
-                    mcts = BatchedMCTS(self.agent.net, 1, self.agent.action_size, self.agent.mcts_simulations)
-                    roots = mcts.run(np.expand_dims(obs, 0))
-                    root = roots[0]
-                    visit_counts = np.array([child['visit_count'] for child in root.children.values()])
-                    action = int(np.argmax(visit_counts)) if visit_counts.sum() > 0 else random.choice(range(self.agent.action_size))
-                    result = self.env.step(action)
-                    if len(result) == 5:
-                        obs, reward, done, truncated, info = result
-                        done = done or truncated
-                    else:
-                        obs, reward, done, info = result
-                    if isinstance(obs, tuple):
-                        obs = obs[0]
-                    total_reward += reward
-                total_rewards.append(total_reward)
-                if total_reward > 0:
-                    wins += 1
-        self.agent.net.train()
-        avg_reward = np.mean(total_rewards)
-        win_rate = wins / self.num_eval_episodes
+    def play_game(self, starting_player=0):
+        """
+        Play a single game between current_agent and best_agent.
+        Alternate moves based on starting_player (0: current starts, 1: best starts).
+        Each agent uses its own MCTS search.
+        """
+        obs = self.env.reset()
+        if isinstance(obs, tuple):
+            obs = obs[0]
+        done = False
+        turn = starting_player
+        while not done:
+            if turn == 0:
+                # current_agent's move
+                mcts = BatchedMCTS(self.current_agent.net, 1, self.current_agent.action_size, self.current_agent.mcts_simulations)
+            else:
+                # best_agent's move
+                mcts = BatchedMCTS(self.best_agent.net, 1, self.best_agent.action_size, self.best_agent.mcts_simulations)
+            roots = mcts.run(np.expand_dims(obs, 0))
+            root = roots[0]
+            # Get valid moves mask
+            invalid_moves = obs[govars.INVD_CHNL]
+            valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
+            valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+            visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0 
+                                     for a, child in root.children.items()])
+            if visit_counts.sum() > 0:
+                action = int(np.argmax(visit_counts))
+            else:
+                valid_actions = np.nonzero(valid_mask)[0]
+                action = int(random.choice(valid_actions))
+            # Execute action in environment
+            result = self.env.step(action)
+            if len(result) == 5:
+                obs, reward, done, truncated, info = result
+                done = done or truncated
+            else:
+                obs, reward, done, info = result
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            # Alternate turn after each move
+            turn = 1 - turn
+        # For this example, assume a positive reward indicates a win for current_agent
+        # You might need to adjust based on your environment's reward structure.
+        return 1 if reward > 0 else 0
 
-        opponent_rating = 1000
-        expected = 1 / (1 + 10 ** ((opponent_rating - self.elo_rating) / 400))
-        self.elo_rating = self.elo_rating + config.elo_k * (win_rate - expected)
+    def evaluate(self):
+        current_wins = 0
+        # Alternate which agent starts to balance first-move advantages
+        for i in range(self.num_games):
+            starting_player = i % 2  # Alternate starting players
+            result = self.play_game(starting_player=starting_player)
+            # If best_agent starts (turn=1), then a win (reward > 0) means best_agent won,
+            # so invert the outcome for current_agent’s perspective.
+            if starting_player == 1:
+                result = 1 - result
+            current_wins += result
 
-        self.episodes.append(episode)
-        self.avg_rewards.append(avg_reward)
-        self.win_rates.append(win_rate)
-        self.elo_ratings.append(self.elo_rating)
-        return avg_reward, win_rate, self.elo_rating
+        win_rate = current_wins / self.num_games
+
+        # Update Elo ratings for both agents using the Elo update formula:
+        expected_score = 1 / (1 + 10 ** ((self.best_elo - self.current_elo) / 400))
+        self.current_elo += config.elo_k * (win_rate - expected_score)
+        self.best_elo += config.elo_k * ((1 - win_rate) - (1 - expected_score))
+
+        return win_rate, self.current_elo
+
 
 # Main Training Loop
 def main():
     board_size = config.board_size
     env_action_size = board_size * board_size + 1
     agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
+    # Create a separate best agent (deep copy) for evaluation:
+    best_agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
+    best_agent.net.load_state_dict(agent.net.state_dict())
+    
     vec_env = VectorGoEnv(config.num_envs, board_size)
     batched_mcts = BatchedMCTS(agent.net, config.num_envs, env_action_size, config.mcts_simulations)
     replay_buffer = deque(maxlen=config.replay_buffer_size)
-    evaluator = Evaluator(agent, gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real'), num_eval_episodes=5)
+    # Use the same Go environment for evaluation matches
+    eval_env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
+    selfplay_evaluator = SelfPlayEvaluator(agent, best_agent, eval_env, num_games=20)
     
     episode_count = 0
     start_time = time.time()  # To track elapsed time
@@ -458,7 +513,7 @@ def main():
         done = [False] * config.num_envs
         trajectories = [{'observations': [obs], 'actions': [], 'rewards': [], 'policies': []} 
                         for obs in observations]
-        new_episodes = 0  # Track new episodes in this batch
+        new_episodes = 0
 
         while not all(done):
             roots = batched_mcts.run(observations)
@@ -476,7 +531,7 @@ def main():
                     else:
                         valid_actions = [a for a, v in enumerate(valid_mask) if v > 0]
                         action = random.choice(valid_actions)
-                        policy = np.zeros_like(visit_counts)
+                        policy = np.zeros(env_action_size)
                         policy[action] = 1.0
                     actions.append(action)
                     policies.append(policy)
@@ -497,13 +552,12 @@ def main():
                         episode_count += 1
                         new_episodes += 1
                         elapsed = time.time() - start_time
-                        logger.info(f"Episode {episode_count} completed | Total Episodes: {episode_count} | Elapsed Time: {elapsed:.2f}s")
-                        # Log to wandb as well if needed:
+                        logger.info(f"Episode {episode_count} completed | Elapsed Time: {elapsed:.2f}s")
                         wandb.log({"episode_complete": episode_count, "elapsed_time": elapsed})
 
             observations = next_observations
 
-        # Training updates for the batch of new episodes
+        # Training updates for this batch of new episodes
         batch_losses = []
         for step in range(new_episodes):
             loss = agent.train(replay_buffer, config.batch_size)
@@ -514,27 +568,29 @@ def main():
                 wandb.log({"training_loss": loss, "episode": current_episode})
         if batch_losses:
             avg_loss = np.mean(batch_losses)
-            logger.info(f"Batch Training Summary | Episodes: {new_episodes} | Average Loss: {avg_loss:.4f}")
+            logger.info(f"Batch Training Summary | Episodes: {new_episodes} | Avg Loss: {avg_loss:.4f}")
 
-        # Evaluation at fixed intervals
+        # Run self-play evaluation at fixed intervals
         if episode_count > 0 and episode_count % config.evaluation_interval == 0:
-            avg_eval_reward, win_rate, current_elo = evaluator.evaluate(episode_count)
-            logger.info(f"Evaluation at Episode {episode_count} | Avg Reward: {avg_eval_reward:.2f} | Win Rate: {win_rate:.2f} | Elo Rating: {current_elo:.2f}")
-            wandb.log({
-                "evaluation_avg_reward": avg_eval_reward,
-                "evaluation_win_rate": win_rate,
-                "elo_rating": current_elo,
-                "episode": episode_count
-            })
+            win_rate, new_elo = selfplay_evaluator.evaluate()
+            logger.info(f"Self-play Evaluation at Episode {episode_count} | Win Rate: {win_rate:.2f} | Elo: {new_elo:.2f}")
+            wandb.log({"selfplay_win_rate": win_rate, "selfplay_elo": new_elo, "episode": episode_count})
+            # If the current agent outperforms the best agent by a threshold, update best_agent.
+            if win_rate > 0.55:  # Adjust the threshold as needed.
+                best_agent.net.load_state_dict(agent.net.state_dict())
+                logger.info("Best agent updated with current agent's parameters.")
+
+            # Optionally, save models at intervals.
             if episode_count % 10000 == 0:
                 model_path = f"muzero_model_episode_{episode_count}.pth"
                 torch.save(agent.net.state_dict(), model_path)
                 wandb.save(model_path)
 
-    # Final model save and finish
+    # Final save
     torch.save(agent.net.state_dict(), "muzero_model_final.pth")
     wandb.save("muzero_model_final.pth")
     wandb.finish()
+
 
 if __name__ == "__main__":
     wandb.init(project="muzero_go_vectorized", config=vars(config))
