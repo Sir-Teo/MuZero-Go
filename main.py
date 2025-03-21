@@ -26,7 +26,7 @@ class Config:
     max_board_size = 6  # Maximum board size (defines action space)
     board_size = 6      # Default training board size
     latent_dim = 64
-    learning_rate = 1e-4
+    learning_rate = 1e-5
     mcts_simulations = 50
     num_episodes = 100000
     num_envs = 32       # Number of parallel environments
@@ -268,8 +268,8 @@ class BatchedMCTS:
                     value = values[idx].item()
                     is_terminal = (reward != 0)  # Customize as needed
                     child_node = MCTSNode(next_latent, prior=0, terminal=is_terminal)
-                    # Apply valid move mask to child policy
-                    next_obs = observations[env_idx]  # This should ideally be the next state; approximate here
+                    backup_value = reward + config.discount * value  # incorporate immediate reward
+                    self.backpropagate(path + [child_node], backup_value)
                     invalid_moves = next_obs[govars.INVD_CHNL]
                     valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
                     valid_mask = np.concatenate([valid_mask, np.array([1.0])])
@@ -342,7 +342,7 @@ class MuZeroAgent:
         with torch.cuda.amp.autocast():  # Updated API
             for trajectory in batch:
                 traj_length = len(trajectory['actions'])
-                start_index = random.randint(0, traj_length)
+                start_index = random.randint(0, traj_length - 1)
                 initial_obs = trajectory['observations'][start_index]
                 initial_obs_tensor = torch.FloatTensor(initial_obs).unsqueeze(0).to(device)
                 latent, value, policy_logits = self.net.initial_inference(initial_obs_tensor)
@@ -465,7 +465,7 @@ class SelfPlayEvaluator:
             turn = 1 - turn
         # For this example, assume a positive reward indicates a win for current_agent
         # You might need to adjust based on your environment's reward structure.
-        return 1 if reward > 0 else 0
+        return 1 if info.get('winner') == (0 if starting_player == 0 else 1) else 0
 
     def evaluate(self):
         current_wins = 0
