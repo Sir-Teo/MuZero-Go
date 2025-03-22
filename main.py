@@ -23,12 +23,11 @@ logger = logging.getLogger(__name__)
 
 # Configuration & Hyperparameters
 class Config:
-    board_size = 6      # Fixed board size (used for both training and maximum action space)
+    board_size = 6      # Fixed board size (used for training and maximum action space)
     latent_dim = 64
     learning_rate = 1e-4
     mcts_simulations = 256
     num_episodes = 100000
-    num_envs = 4       # Number of parallel environments
     replay_buffer_size = 10000
     batch_size = 64
     unroll_steps = 16
@@ -51,7 +50,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class RepresentationNetwork(nn.Module):
     def __init__(self, latent_dim):
         super(RepresentationNetwork, self).__init__()
-        # Assumes 6-channel input as in gym-go's observation space.
         self.conv1 = nn.Conv2d(6, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(64, latent_dim, kernel_size=3, padding=1)
@@ -62,9 +60,6 @@ class RepresentationNetwork(nn.Module):
         x = self.relu(self.conv2(x))
         x = self.relu(self.conv3(x))
         return x
-
-    def evaluate(self):
-        pass
 
 class DynamicsNetwork(nn.Module):
     def __init__(self, latent_dim, max_action_size):
@@ -124,11 +119,11 @@ class MuZeroNet(nn.Module):
         value, policy_logits = self.prediction(next_latent)
         return next_latent, reward, value, policy_logits
 
-# MCTS Node
+# MCTS Node for single environment
 class MCTSNode:
     def __init__(self, latent, prior, terminal=False):
-        self.latent = latent
-        self.prior = prior
+        self.latent = latent  # latent representation (tensor)
+        self.prior = prior    # prior probability for this node
         self.visit_count = 0
         self.value_sum = 0
         self.children = {}
@@ -137,90 +132,79 @@ class MCTSNode:
     def value(self):
         return self.value_sum / self.visit_count if self.visit_count > 0 else 0
 
-# Vanilla (non-batched) MCTS
+# Simplified single-environment MCTS
 class MCTS:
     def __init__(self, muzero_net, action_size, num_simulations, c_puct=1.0):
         self.net = muzero_net
         self.action_size = action_size
         self.num_simulations = num_simulations
         self.c_puct = c_puct
-        self.root = None
 
     def run(self, observation):
-        # Convert observation to tensor and run initial inference.
-        obs_tensor = torch.FloatTensor(np.expand_dims(observation, axis=0)).to(device)
+        obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(device)
         latent, value, policy_logits = self.net.initial_inference(obs_tensor)
         policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
-        
-        # Compute valid move mask from observation.
+
         invalid_moves = observation[govars.INVD_CHNL]
         valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
         valid_mask = np.concatenate([valid_mask, np.array([1.0])])
-        if valid_mask[:-1].sum() > 0:
-            valid_mask[-1] *= 0.9
 
-        masked_policy = policy * valid_mask
-        if masked_policy.sum() > 0:
-            masked_policy /= masked_policy.sum()
-        else:
-            masked_policy = valid_mask / valid_mask.sum()
-
-        # Create the root node.
-        self.root = MCTSNode(latent[0], prior=0)
+        root = MCTSNode(latent[0], prior=0)
         for a in range(self.action_size):
-            self.root.children[a] = {
+            prior = policy[a] if valid_mask[a] > 0 else 0
+            root.children[a] = {
                 'node': None,
-                'prior': masked_policy[a] if valid_mask[a] > 0 else 0,
+                'prior': prior,
                 'action': a,
                 'visit_count': 0,
                 'value_sum': 0
             }
-        # Save valid_mask for later use in simulation.
-        self.valid_mask = valid_mask
 
-        # Run MCTS simulations.
+        # For logging: keep track of visits across simulations
+        total_visits = 0
+
         for _ in range(self.num_simulations):
-            path, action = self.select_leaf(self.root)
+            path, action = self.select_leaf(root)
             leaf = path[-1]
-            if leaf.terminal or action is None:
-                continue
-            latent_tensor = leaf.latent.unsqueeze(0)
-            action_tensor = torch.LongTensor([action]).to(device)
-            next_latent, reward, value, policy_logits = self.net.recurrent_inference(latent_tensor, action_tensor)
-            policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
-            is_terminal = (reward.item() != 0)
-            child_node = MCTSNode(next_latent[0], prior=0, terminal=is_terminal)
-            masked_child_policy = policy * self.valid_mask
-            if masked_child_policy.sum() > 0:
-                masked_child_policy /= masked_child_policy.sum()
-            else:
-                masked_child_policy = self.valid_mask / self.valid_mask.sum()
-            for a in range(self.action_size):
-                child_node.children[a] = {
-                    'node': None,
-                    'prior': masked_child_policy[a] if self.valid_mask[a] > 0 else 0,
-                    'action': a,
-                    'visit_count': 0,
-                    'value_sum': 0
-                }
-            backup_value = reward.item() + config.discount * value.item()
-            leaf.children[action]['node'] = child_node
-            self.backpropagate(path + [child_node], backup_value)
-        return self.root
+            if not leaf.terminal and action is not None:
+                latent_input = leaf.latent.unsqueeze(0)
+                action_tensor = torch.LongTensor([action]).to(device)
+                next_latent, reward, value, policy_logits = self.net.recurrent_inference(latent_input, action_tensor)
+                policy_child = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
 
-    def select_leaf(self, node):
+                child_node = MCTSNode(next_latent[0], prior=0, terminal=(reward.item() != 0))
+                for a in range(self.action_size):
+                    prior_child = policy_child[a] if valid_mask[a] > 0 else 0
+                    child_node.children[a] = {
+                        'node': None,
+                        'prior': prior_child,
+                        'action': a,
+                        'visit_count': 0,
+                        'value_sum': 0
+                    }
+                backup_value = reward.item() + config.discount * value.item()
+                leaf.children[action]['node'] = child_node
+                self.backpropagate(path + [child_node], backup_value)
+                total_visits += 1
+
+        # Log the total visits from MCTS simulations for this root search
+        wandb.log({"mcts_total_visits": total_visits})
+        return root
+
+    def select_leaf(self, tree):
+        node = tree
         path = [node]
         while node.children and all(child['node'] is not None for child in node.children.values() if child['prior'] > 0):
             best_score = -float('inf')
             best_action = None
-            for action, child in node.children.items():
+            for a, child in node.children.items():
                 if child['prior'] > 0:
                     Q = child['value_sum'] / child['visit_count'] if child['visit_count'] > 0 else 0
                     U = self.c_puct * child['prior'] * np.sqrt(node.visit_count + 1) / (1 + child['visit_count'])
                     score = Q + U
                     if score > best_score:
                         best_score = score
-                        best_action = action
+                        best_action = a
             if best_action is None:
                 break
             node = node.children[best_action]['node']
@@ -237,58 +221,12 @@ class MCTS:
             node.visit_count += 1
             node.value_sum += value
 
-# Vectorized Environment
-class VectorGoEnv:
-    def __init__(self, num_envs, board_size):
-        self.envs = [gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real') 
-                     for _ in range(num_envs)]
-        self.num_envs = num_envs
-        self.dones = [False] * num_envs
-        self.last_observations = [None] * num_envs
-
-    def reset(self):
-        observations = []
-        for i, env in enumerate(self.envs):
-            obs = env.reset()
-            if isinstance(obs, tuple):
-                obs = obs[0]
-            observations.append(obs)
-            self.dones[i] = False
-            self.last_observations[i] = obs
-        return np.stack(observations)
-
-    def step(self, actions):
-        observations, rewards, dones, infos = [], [], [], []
-        for i, (env, action) in enumerate(zip(self.envs, actions)):
-            if not self.dones[i]:
-                result = env.step(action)
-                if len(result) == 5:
-                    obs, reward, done, truncated, info = result
-                    done = done or truncated
-                else:
-                    obs, reward, done, info = result
-                if isinstance(obs, tuple):
-                    obs = obs[0]
-                observations.append(obs)
-                rewards.append(reward)
-                dones.append(done)
-                infos.append(info)
-                self.dones[i] = done
-                self.last_observations[i] = obs
-            else:
-                observations.append(self.last_observations[i])
-                rewards.append(0.0)
-                dones.append(True)
-                infos.append({'done': True})
-        return np.stack(observations), np.array(rewards), np.array(dones), infos
-
 # MuZero Agent
 class MuZeroAgent:
     def __init__(self, board_size, latent_dim, env_action_size, num_simulations):
         self.board_size = board_size
         self.action_size = env_action_size
-        # Since board_size is fixed, max_action_size is identical to env_action_size.
-        max_action_size = board_size * board_size + 1
+        max_action_size = board_size * board_size + 1  # board moves plus pass
         self.net = MuZeroNet(latent_dim, max_action_size).to(device)
         self.mcts_simulations = num_simulations
         self.optimizer = optim.Adam(self.net.parameters(), lr=config.learning_rate)
@@ -305,7 +243,7 @@ class MuZeroAgent:
         with torch.cuda.amp.autocast():
             for trajectory in batch:
                 traj_length = len(trajectory['actions'])
-                start_index = random.randint(0, traj_length - 1) 
+                start_index = random.randint(0, traj_length - 1)
                 initial_obs = trajectory['observations'][start_index]
                 initial_obs_tensor = torch.FloatTensor(initial_obs).unsqueeze(0).to(device)
                 latent, value, policy_logits = self.net.initial_inference(initial_obs_tensor)
@@ -354,6 +292,8 @@ class MuZeroAgent:
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
         scaler.step(self.optimizer)
         scaler.update()
+        # Log the loss per training update
+        wandb.log({"training_loss": loss_total / batch_size})
         return loss_total / batch_size
 
     def compute_target_value(self, trajectory, index, unroll_steps):
@@ -395,13 +335,14 @@ class SelfPlayEvaluator:
                 mcts = MCTS(self.current_agent.net, self.current_agent.action_size, self.current_agent.mcts_simulations)
             else:
                 mcts = MCTS(self.best_agent.net, self.best_agent.action_size, self.best_agent.mcts_simulations)
-            # Run MCTS on the current observation.
             root = mcts.run(obs)
             invalid_moves = obs[govars.INVD_CHNL]
             valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
             valid_mask = np.concatenate([valid_mask, np.array([1.0])])
             visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0 
                                      for a, child in root.children.items()])
+            # Log the maximum visit count from MCTS for this move
+            wandb.log({"mcts_max_visit": int(np.max(visit_counts))})
             if visit_counts.sum() > 0:
                 action = int(np.argmax(visit_counts))
             else:
@@ -438,9 +379,10 @@ class SelfPlayEvaluator:
         self.current_elo += config.elo_k * (win_rate - expected_score)
         self.best_elo += config.elo_k * ((1 - win_rate) - (1 - expected_score))
 
+        wandb.log({"selfplay_win_rate": win_rate, "current_elo": self.current_elo})
         return win_rate, self.current_elo
 
-# Main Training Loop
+# Main Training Loop using a single environment
 def main():
     board_size = config.board_size  # Fixed board size of 6
     env_action_size = board_size * board_size + 1
@@ -448,83 +390,73 @@ def main():
     best_agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
     best_agent.net.load_state_dict(agent.net.state_dict())
     
-    vec_env = VectorGoEnv(config.num_envs, board_size)
+    env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
     replay_buffer = deque(maxlen=config.replay_buffer_size)
-    eval_env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
-    selfplay_evaluator = SelfPlayEvaluator(agent, best_agent, eval_env, num_games=20)
+    selfplay_evaluator = SelfPlayEvaluator(agent, best_agent, env, num_games=20)
     
     episode_count = 0
     start_time = time.time()
 
     while episode_count < config.num_episodes:
-        observations = vec_env.reset()
-        done = [False] * config.num_envs
-        trajectories = [{'observations': [obs], 'actions': [], 'rewards': [], 'policies': []} 
-                        for obs in observations]
-        new_episodes = 0
+        obs = env.reset()
+        if isinstance(obs, tuple):
+            obs = obs[0]
+        trajectory = {
+            'observations': [obs],
+            'actions': [],
+            'rewards': [],
+            'policies': []
+        }
+        done = False
+        episode_reward = 0.0  # To track total reward per episode
 
-        while not all(done):
-            roots = []
-            # Run vanilla MCTS for each active environment.
-            for i, obs in enumerate(observations):
-                if not done[i]:
-                    mcts = MCTS(agent.net, env_action_size, config.mcts_simulations)
-                    root = mcts.run(obs)
-                    roots.append(root)
-                else:
-                    roots.append(None)
-            actions, policies = [], []
-            for i, root in enumerate(roots):
-                if not done[i] and root is not None:
-                    invalid_moves = observations[i][govars.INVD_CHNL]
-                    valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-                    valid_mask = np.concatenate([valid_mask, np.array([1.0])])
-                    visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0 
-                                             for a, child in root.children.items()])
-                    if visit_counts.sum() > 0:
-                        action = int(np.argmax(visit_counts))
-                        policy = visit_counts / visit_counts.sum()
-                    else:
-                        valid_actions = [a for a, v in enumerate(valid_mask) if v > 0]
-                        action = random.choice(valid_actions)
-                        policy = np.zeros(env_action_size)
-                        policy[action] = 1.0
-                    actions.append(action)
-                    policies.append(policy)
-                else:
-                    actions.append(env_action_size - 1)  # Pass move.
-                    policies.append(np.zeros(env_action_size))
+        # Play a full self-play game (episode)
+        while not done:
+            mcts = MCTS(agent.net, env_action_size, config.mcts_simulations)
+            root = mcts.run(obs)
+            invalid_moves = obs[govars.INVD_CHNL]
+            valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
+            valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+            visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0 
+                                     for a, child in root.children.items()])
+            if visit_counts.sum() > 0:
+                action = int(np.argmax(visit_counts))
+                policy = visit_counts / visit_counts.sum()
+            else:
+                valid_actions = np.nonzero(valid_mask)[0]
+                action = int(random.choice(valid_actions))
+                policy = np.zeros(env_action_size)
+                policy[action] = 1.0
 
-            next_observations, rewards, dones, infos = vec_env.step(actions)
-            for i in range(config.num_envs):
-                if not done[i]:
-                    trajectories[i]['actions'].append(actions[i])
-                    trajectories[i]['rewards'].append(rewards[i])
-                    trajectories[i]['policies'].append(policies[i])
-                    trajectories[i]['observations'].append(next_observations[i])
-                    if dones[i]:
-                        done[i] = True
-                        replay_buffer.append(trajectories[i])
-                        episode_count += 1
-                        new_episodes += 1
-                        elapsed = time.time() - start_time
-                        logger.info(f"Episode {episode_count} completed | Elapsed Time: {elapsed:.2f}s")
-                        wandb.log({"episode_complete": episode_count, "elapsed_time": elapsed})
+            trajectory['actions'].append(action)
+            trajectory['policies'].append(policy)
 
-            observations = next_observations
+            result = env.step(action)
+            if len(result) == 5:
+                obs, reward, done, truncated, info = result
+                done = done or truncated
+            else:
+                obs, reward, done, info = result
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            trajectory['rewards'].append(reward)
+            trajectory['observations'].append(obs)
+            episode_reward += reward
 
-        # Training updates for new episodes.
-        batch_losses = []
-        for step in range(new_episodes):
-            loss = agent.train(replay_buffer, config.batch_size)
-            if loss is not None:
-                current_episode = episode_count - new_episodes + step + 1
-                batch_losses.append(loss)
-                logger.info(f"Training Update | Episode {current_episode} | Loss: {loss:.4f}")
-                wandb.log({"training_loss": loss, "episode": current_episode})
-        if batch_losses:
-            avg_loss = np.mean(batch_losses)
-            logger.info(f"Batch Training Summary | Episodes: {new_episodes} | Avg Loss: {avg_loss:.4f}")
+            # Log the reward and max visits for this move
+            wandb.log({"move_reward": reward, "move_max_visit": int(np.max(visit_counts))})
+
+        replay_buffer.append(trajectory)
+        episode_count += 1
+        elapsed = time.time() - start_time
+        logger.info(f"Episode {episode_count} completed | Elapsed Time: {elapsed:.2f}s | Episode Reward: {episode_reward:.2f}")
+        wandb.log({"episode_complete": episode_count, "elapsed_time": elapsed, "episode_reward": episode_reward})
+
+        # Training updates for the completed episode.
+        loss = agent.train(replay_buffer, config.batch_size)
+        if loss is not None:
+            logger.info(f"Training Update | Episode {episode_count} | Loss: {loss:.4f}")
+            # (Training loss is also logged inside the train() function)
 
         # Self-play evaluation at fixed intervals.
         if episode_count > 0 and episode_count % config.evaluation_interval == 0:
@@ -544,9 +476,8 @@ def main():
     wandb.save("muzero_model_final.pth")
     wandb.finish()
 
-
 if __name__ == "__main__":
-    wandb.init(project="muzero_go_vectorized", config=vars(config))
+    wandb.init(project="muzero_go_single", config=vars(config))
     logger.info("Starting training process...")
     main()
     logger.info("Training completed.")
