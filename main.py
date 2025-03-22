@@ -8,6 +8,10 @@ import logging
 import wandb
 import warnings
 import time
+import gym
+import numpy as np
+
+from gym_go import govars, rendering, gogame
 
 # Suppress gym warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="gym.utils.passive_env_checker")
@@ -19,16 +23,15 @@ logger = logging.getLogger(__name__)
 
 # Configuration & Hyperparameters
 class Config:
-    max_board_size = 6  # Maximum board size (defines action space)
-    board_size = 6      # Default training board size
+    board_size = 6      # Fixed board size (used for both training and maximum action space)
     latent_dim = 64
     learning_rate = 1e-4
-    mcts_simulations = 50
+    mcts_simulations = 256
     num_episodes = 100000
-    num_envs = 32       # Number of parallel environments
+    num_envs = 4       # Number of parallel environments
     replay_buffer_size = 10000
     batch_size = 64
-    unroll_steps = 32
+    unroll_steps = 16
     discount = 0.99
     value_loss_weight = 1.0
     policy_loss_weight = 1.0
@@ -60,7 +63,6 @@ class RepresentationNetwork(nn.Module):
         x = self.relu(self.conv3(x))
         return x
 
-    # (Optional) Remove or refactor this unused evaluate method if not needed.
     def evaluate(self):
         pass
 
@@ -122,52 +124,6 @@ class MuZeroNet(nn.Module):
         value, policy_logits = self.prediction(next_latent)
         return next_latent, reward, value, policy_logits
 
-# Vectorized Environment
-class VectorGoEnv:
-    def __init__(self, num_envs, board_size):
-        self.envs = [gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real') 
-                     for _ in range(num_envs)]
-        self.num_envs = num_envs
-        self.dones = [False] * num_envs
-        self.last_observations = [None] * num_envs  # Cache last valid observation
-
-    def reset(self):
-        observations = []
-        for i, env in enumerate(self.envs):
-            obs = env.reset()
-            if isinstance(obs, tuple):
-                obs = obs[0]
-            observations.append(obs)
-            self.dones[i] = False
-            self.last_observations[i] = obs  # Initialize with reset observation
-        return np.stack(observations)
-
-    def step(self, actions):
-        observations, rewards, dones, infos = [], [], [], []
-        for i, (env, action) in enumerate(zip(self.envs, actions)):
-            if not self.dones[i]:
-                result = env.step(action)
-                if len(result) == 5:
-                    obs, reward, done, truncated, info = result
-                    done = done or truncated
-                else:
-                    obs, reward, done, info = result
-                if isinstance(obs, tuple):
-                    obs = obs[0]
-                observations.append(obs)
-                rewards.append(reward)
-                dones.append(done)
-                infos.append(info)
-                self.dones[i] = done
-                self.last_observations[i] = obs  # Update last observation
-            else:
-                # Use the last valid observation for done environments
-                observations.append(self.last_observations[i])
-                rewards.append(0.0)
-                dones.append(True)
-                infos.append({'done': True})
-        return np.stack(observations), np.array(rewards), np.array(dones), infos
-
 # MCTS Node
 class MCTSNode:
     def __init__(self, latent, prior, terminal=False):
@@ -181,99 +137,84 @@ class MCTSNode:
     def value(self):
         return self.value_sum / self.visit_count if self.visit_count > 0 else 0
 
-# Batched MCTS
-class BatchedMCTS:
-    def __init__(self, muzero_net, num_envs, action_size, num_simulations, c_puct=1.0):
+# Vanilla (non-batched) MCTS
+class MCTS:
+    def __init__(self, muzero_net, action_size, num_simulations, c_puct=1.0):
         self.net = muzero_net
-        self.num_envs = num_envs
         self.action_size = action_size
         self.num_simulations = num_simulations
         self.c_puct = c_puct
-        self.trees = [MCTSNode(None, 0) for _ in range(num_envs)]
+        self.root = None
 
-    def run(self, observations):
-        obs_tensor = torch.FloatTensor(observations).to(device)
-        latents, values, policy_logits = self.net.initial_inference(obs_tensor)
-        policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()
+    def run(self, observation):
+        # Convert observation to tensor and run initial inference.
+        obs_tensor = torch.FloatTensor(np.expand_dims(observation, axis=0)).to(device)
+        latent, value, policy_logits = self.net.initial_inference(obs_tensor)
+        policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
+        
+        # Compute valid move mask from observation.
+        invalid_moves = observation[govars.INVD_CHNL]
+        valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
+        valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+        if valid_mask[:-1].sum() > 0:
+            valid_mask[-1] *= 0.9
 
-        for i in range(self.num_envs):
-            invalid_moves = observations[i, govars.INVD_CHNL]
-            valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-            valid_mask = np.concatenate([valid_mask, np.array([1.0])])  # Include pass move
-            if valid_mask[:-1].sum() > 0:
-                valid_mask[-1] *= 0.9  # Slightly penalize passing
+        masked_policy = policy * valid_mask
+        if masked_policy.sum() > 0:
+            masked_policy /= masked_policy.sum()
+        else:
+            masked_policy = valid_mask / valid_mask.sum()
 
-            masked_policy = policy[i] * valid_mask
-            if masked_policy.sum() > 0:
-                masked_policy /= masked_policy.sum()
+        # Create the root node.
+        self.root = MCTSNode(latent[0], prior=0)
+        for a in range(self.action_size):
+            self.root.children[a] = {
+                'node': None,
+                'prior': masked_policy[a] if valid_mask[a] > 0 else 0,
+                'action': a,
+                'visit_count': 0,
+                'value_sum': 0
+            }
+        # Save valid_mask for later use in simulation.
+        self.valid_mask = valid_mask
+
+        # Run MCTS simulations.
+        for _ in range(self.num_simulations):
+            path, action = self.select_leaf(self.root)
+            leaf = path[-1]
+            if leaf.terminal or action is None:
+                continue
+            latent_tensor = leaf.latent.unsqueeze(0)
+            action_tensor = torch.LongTensor([action]).to(device)
+            next_latent, reward, value, policy_logits = self.net.recurrent_inference(latent_tensor, action_tensor)
+            policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
+            is_terminal = (reward.item() != 0)
+            child_node = MCTSNode(next_latent[0], prior=0, terminal=is_terminal)
+            masked_child_policy = policy * self.valid_mask
+            if masked_child_policy.sum() > 0:
+                masked_child_policy /= masked_child_policy.sum()
             else:
-                masked_policy = valid_mask / valid_mask.sum()
-
-            root = MCTSNode(latents[i], prior=0)
+                masked_child_policy = self.valid_mask / self.valid_mask.sum()
             for a in range(self.action_size):
-                root.children[a] = {
+                child_node.children[a] = {
                     'node': None,
-                    'prior': masked_policy[a] if valid_mask[a] > 0 else 0,  # Zero prior for invalid moves
+                    'prior': masked_child_policy[a] if self.valid_mask[a] > 0 else 0,
                     'action': a,
                     'visit_count': 0,
                     'value_sum': 0
                 }
-            self.trees[i] = root
+            backup_value = reward.item() + config.discount * value.item()
+            leaf.children[action]['node'] = child_node
+            self.backpropagate(path + [child_node], backup_value)
+        return self.root
 
-        for _ in range(self.num_simulations):
-            all_latents, all_actions, expansion_indices = [], [], []
-            for env_idx in range(self.num_envs):
-                path, action = self.select_leaf(self.trees[env_idx])
-                leaf = path[-1]
-                if not leaf.terminal and action is not None:
-                    all_latents.append(leaf.latent)
-                    all_actions.append(action)
-                    expansion_indices.append((env_idx, path, action))
-
-            if all_latents:
-                latents_tensor = torch.stack(all_latents).to(device)
-                actions_tensor = torch.LongTensor(all_actions).to(device)
-                next_latents, rewards, values, policy_logits = self.net.recurrent_inference(latents_tensor, actions_tensor)
-                policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()
-
-                for idx, (env_idx, path, action) in enumerate(expansion_indices):
-                    tree = self.trees[env_idx]
-                    leaf = path[-1]
-                    next_latent = next_latents[idx]
-                    reward = rewards[idx].item()
-                    value = values[idx].item()
-                    is_terminal = (reward != 0)  # Adjust terminal condition if needed
-                    child_node = MCTSNode(next_latent, prior=0, terminal=is_terminal)
-                    
-                    next_obs = observations[env_idx]
-                    invalid_moves = next_obs[govars.INVD_CHNL]
-                    valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-                    valid_mask = np.concatenate([valid_mask, np.array([1.0])])
-                    masked_child_policy = policy[idx] * valid_mask
-                    if masked_child_policy.sum() > 0:
-                        masked_child_policy /= masked_child_policy.sum()
-                    
-                    for a in range(self.action_size):
-                        child_node.children[a] = {
-                            'node': None,
-                            'prior': masked_child_policy[a] if valid_mask[a] > 0 else 0,
-                            'action': a,
-                            'visit_count': 0,
-                            'value_sum': 0
-                        }
-                    backup_value = reward + config.discount * value
-                    leaf.children[action]['node'] = child_node
-                    self.backpropagate(path + [child_node], backup_value)
-        return self.trees
-
-    def select_leaf(self, tree):
-        node = tree
+    def select_leaf(self, node):
         path = [node]
         while node.children and all(child['node'] is not None for child in node.children.values() if child['prior'] > 0):
             best_score = -float('inf')
             best_action = None
             for action, child in node.children.items():
-                if child['prior'] > 0:  # Only consider valid moves
+                if child['prior'] > 0:
                     Q = child['value_sum'] / child['visit_count'] if child['visit_count'] > 0 else 0
                     U = self.c_puct * child['prior'] * np.sqrt(node.visit_count + 1) / (1 + child['visit_count'])
                     score = Q + U
@@ -296,12 +237,58 @@ class BatchedMCTS:
             node.visit_count += 1
             node.value_sum += value
 
+# Vectorized Environment
+class VectorGoEnv:
+    def __init__(self, num_envs, board_size):
+        self.envs = [gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real') 
+                     for _ in range(num_envs)]
+        self.num_envs = num_envs
+        self.dones = [False] * num_envs
+        self.last_observations = [None] * num_envs
+
+    def reset(self):
+        observations = []
+        for i, env in enumerate(self.envs):
+            obs = env.reset()
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            observations.append(obs)
+            self.dones[i] = False
+            self.last_observations[i] = obs
+        return np.stack(observations)
+
+    def step(self, actions):
+        observations, rewards, dones, infos = [], [], [], []
+        for i, (env, action) in enumerate(zip(self.envs, actions)):
+            if not self.dones[i]:
+                result = env.step(action)
+                if len(result) == 5:
+                    obs, reward, done, truncated, info = result
+                    done = done or truncated
+                else:
+                    obs, reward, done, info = result
+                if isinstance(obs, tuple):
+                    obs = obs[0]
+                observations.append(obs)
+                rewards.append(reward)
+                dones.append(done)
+                infos.append(info)
+                self.dones[i] = done
+                self.last_observations[i] = obs
+            else:
+                observations.append(self.last_observations[i])
+                rewards.append(0.0)
+                dones.append(True)
+                infos.append({'done': True})
+        return np.stack(observations), np.array(rewards), np.array(dones), infos
+
 # MuZero Agent
 class MuZeroAgent:
     def __init__(self, board_size, latent_dim, env_action_size, num_simulations):
         self.board_size = board_size
         self.action_size = env_action_size
-        max_action_size = config.max_board_size * config.max_board_size + 1
+        # Since board_size is fixed, max_action_size is identical to env_action_size.
+        max_action_size = board_size * board_size + 1
         self.net = MuZeroNet(latent_dim, max_action_size).to(device)
         self.mcts_simulations = num_simulations
         self.optimizer = optim.Adam(self.net.parameters(), lr=config.learning_rate)
@@ -364,6 +351,7 @@ class MuZeroAgent:
                 losses += step_losses
                 loss_total += step_losses.item()
         scaler.scale(losses).backward()
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
         scaler.step(self.optimizer)
         scaler.update()
         return loss_total / batch_size
@@ -390,18 +378,13 @@ class MuZeroAgent:
 class SelfPlayEvaluator:
     def __init__(self, current_agent, best_agent, env, num_games=20):
         self.current_agent = current_agent
-        self.best_agent = best_agent  # Snapshot of the best model so far.
+        self.best_agent = best_agent
         self.env = env
         self.num_games = num_games
         self.current_elo = config.initial_elo
         self.best_elo = config.initial_elo
 
     def play_game(self, starting_player=0):
-        """
-        Play a single game between current_agent and best_agent.
-        Alternate moves based on starting_player (0: current agent starts as black, 1: best agent starts as black).
-        Each agent uses its own MCTS search.
-        """
         obs = self.env.reset()
         if isinstance(obs, tuple):
             obs = obs[0]
@@ -409,11 +392,11 @@ class SelfPlayEvaluator:
         turn = starting_player
         while not done:
             if turn == 0:
-                mcts = BatchedMCTS(self.current_agent.net, 1, self.current_agent.action_size, self.current_agent.mcts_simulations)
+                mcts = MCTS(self.current_agent.net, self.current_agent.action_size, self.current_agent.mcts_simulations)
             else:
-                mcts = BatchedMCTS(self.best_agent.net, 1, self.best_agent.action_size, self.best_agent.mcts_simulations)
-            roots = mcts.run(np.expand_dims(obs, 0))
-            root = roots[0]
+                mcts = MCTS(self.best_agent.net, self.best_agent.action_size, self.best_agent.mcts_simulations)
+            # Run MCTS on the current observation.
+            root = mcts.run(obs)
             invalid_moves = obs[govars.INVD_CHNL]
             valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
             valid_mask = np.concatenate([valid_mask, np.array([1.0])])
@@ -434,10 +417,7 @@ class SelfPlayEvaluator:
                 obs = obs[0]
             turn = 1 - turn
 
-        # After game is over, use env.winner() to decide the winner.
         winner = self.env.winner()
-        # If current_agent is black (starting_player == 0), win if winner == 1.
-        # If current_agent is white (starting_player == 1), win if winner == -1.
         if starting_player == 0:
             return 1 if winner == 1 else 0
         else:
@@ -446,9 +426,8 @@ class SelfPlayEvaluator:
     def evaluate(self):
         current_wins = 0
         for i in range(self.num_games):
-            starting_player = i % 2  # Alternate starting players.
+            starting_player = i % 2
             result = self.play_game(starting_player=starting_player)
-            # Adjust result: when best agent starts, invert outcome for current_agent's perspective.
             if starting_player == 1:
                 result = 1 - result
             current_wins += result
@@ -463,14 +442,13 @@ class SelfPlayEvaluator:
 
 # Main Training Loop
 def main():
-    board_size = config.board_size
+    board_size = config.board_size  # Fixed board size of 6
     env_action_size = board_size * board_size + 1
     agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
     best_agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
     best_agent.net.load_state_dict(agent.net.state_dict())
     
     vec_env = VectorGoEnv(config.num_envs, board_size)
-    batched_mcts = BatchedMCTS(agent.net, config.num_envs, env_action_size, config.mcts_simulations)
     replay_buffer = deque(maxlen=config.replay_buffer_size)
     eval_env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
     selfplay_evaluator = SelfPlayEvaluator(agent, best_agent, eval_env, num_games=20)
@@ -486,11 +464,19 @@ def main():
         new_episodes = 0
 
         while not all(done):
-            roots = batched_mcts.run(observations)
+            roots = []
+            # Run vanilla MCTS for each active environment.
+            for i, obs in enumerate(observations):
+                if not done[i]:
+                    mcts = MCTS(agent.net, env_action_size, config.mcts_simulations)
+                    root = mcts.run(obs)
+                    roots.append(root)
+                else:
+                    roots.append(None)
             actions, policies = [], []
             for i, root in enumerate(roots):
-                if not done[i]:
-                    invalid_moves = observations[i, govars.INVD_CHNL]
+                if not done[i] and root is not None:
+                    invalid_moves = observations[i][govars.INVD_CHNL]
                     valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
                     valid_mask = np.concatenate([valid_mask, np.array([1.0])])
                     visit_counts = np.array([child['visit_count'] if valid_mask[a] > 0 else 0 
