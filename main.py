@@ -10,6 +10,7 @@ import warnings
 import time
 import gym
 import numpy as np
+import os
 
 from gym_go import govars, rendering, gogame
 
