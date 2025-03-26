@@ -27,8 +27,8 @@ class Config:
     board_size = 6      # Fixed board size (used for training and maximum action space)
     latent_dim = 64
     learning_rate = 1e-4
-    mcts_simulations = 256
-    num_episodes = 100000
+    mcts_simulations = 64
+    num_episodes = 200000
     replay_buffer_size = 1000
     batch_size = 64
     unroll_steps = 16
@@ -40,7 +40,7 @@ class Config:
     dirichlet_alpha = 0.01
     initial_elo = 1000
     elo_k = 32
-    evaluation_interval = 5
+    evaluation_interval = 10
     # New flags for reward/value scaling and prioritized replay
     use_value_transform = True    # Set True for visually complex domains (e.g. Atari)
     use_prioritized_replay = False # Set True if using prioritized replay (e.g. Atari)
