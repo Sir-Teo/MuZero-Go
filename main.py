@@ -11,6 +11,7 @@ import time
 import gym
 import numpy as np
 import os
+from torch.optim.lr_scheduler import StepLR
 
 from gym_go import govars, rendering, gogame
 
@@ -27,23 +28,24 @@ class Config:
     board_size = 6      # Fixed board size (used for training and maximum action space)
     latent_dim = 64
     learning_rate = 1e-4
-    mcts_simulations = 64
+    mcts_simulations = 128      # increased MCTS rollouts for stronger self-play targets
     num_episodes = 200000
-    replay_buffer_size = 1000
-    batch_size = 64
+    replay_buffer_size = 5000   # larger buffer for more diverse experience
+    batch_size = 128            # larger batches for stable updates
     unroll_steps = 16
     discount = 0.99
     value_loss_weight = 1.0
     policy_loss_weight = 1.0
     reward_loss_weight = 5.0
-    dirichlet_epsilon = 0.02
-    dirichlet_alpha = 0.01
+    dirichlet_epsilon = 0.1
+    dirichlet_alpha = 0.1
     initial_elo = 1000
     elo_k = 32
     evaluation_interval = 10
     # New flags for reward/value scaling and prioritized replay
-    use_value_transform = True    # Set True for visually complex domains (e.g. Atari)
-    use_prioritized_replay = False # Set True if using prioritized replay (e.g. Atari)
+    use_value_transform = True     # Set True for visually complex domains (e.g. Atari)
+    use_prioritized_replay = True  # Enable prioritized replay for faster, focused learning
+    prioritized_replay_beta = 0.6  # Exponent for importance sampling weights
 
 config = Config()
 
@@ -173,7 +175,7 @@ class PrioritizedReplayBuffer:
 
 # Monte Carlo Tree Search (MCTS) implementation with Q-value normalization.
 class MCTS:
-    def __init__(self, muzero_net, action_size, num_simulations, c_puct=3.0):
+    def __init__(self, muzero_net, action_size, num_simulations, c_puct=5.0):
         self.net = muzero_net
         self.action_size = action_size
         self.num_simulations = num_simulations
@@ -298,6 +300,8 @@ class MuZeroAgent:
         self.net = MuZeroNet(latent_dim, max_action_size).to(device)
         self.mcts_simulations = num_simulations
         self.optimizer = optim.Adam(self.net.parameters(), lr=config.learning_rate)
+        # set up a learning-rate scheduler for gradual annealing
+        self.scheduler = StepLR(self.optimizer, step_size=1000, gamma=0.9)
 
     def train(self, replay_buffer, batch_size):
         # Use prioritized replay if enabled.
@@ -422,6 +426,9 @@ class MuZeroAgent:
         if config.use_prioritized_replay:
             new_priorities = [avg_loss] * len(indices)
             replay_buffer.update_priorities(indices, new_priorities)
+        # step the learning-rate scheduler and log the current lr
+        self.scheduler.step()
+        wandb.log({"lr": self.optimizer.param_groups[0]["lr"]})
         return avg_loss
 
     def compute_target_value(self, trajectory, index, unroll_steps):
