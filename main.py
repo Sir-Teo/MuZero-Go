@@ -47,6 +47,7 @@ class Config:
     use_prioritized_replay = True  # Enable prioritized replay for faster, focused learning
     prioritized_replay_beta = 0.6  # Exponent for importance sampling weights
     pass_epsilon = 0.01  # Prior weight for pass when board moves exist
+    max_game_moves = board_size * board_size * 2  # max moves before force-ending a game
 
 config = Config()
 
@@ -473,7 +474,10 @@ class SelfPlayEvaluator:
             obs = obs[0]
         done = False
         turn = starting_player
-        while not done:
+        move_count = 0
+        max_moves = config.max_game_moves
+        # play until game ends or max moves reached
+        while not done and move_count < max_moves:
             if turn == 0:
                 mcts = MCTS(self.current_agent.net, self.current_agent.action_size, self.current_agent.mcts_simulations)
             else:
@@ -503,7 +507,13 @@ class SelfPlayEvaluator:
                 obs, reward, done, info = result
             if isinstance(obs, tuple):
                 obs = obs[0]
+            # increment move counter and toggle turn
+            move_count += 1
             turn = 1 - turn
+        # if we exited due to move limit, log warning and force end
+        if move_count >= max_moves:
+            logger.warning(f"Evaluation game reached max moves ({move_count}), forcing end.")
+            done = True
         winner = self.env.winner()
         if starting_player == 0:
             return 1 if winner == 1 else 0
@@ -564,9 +574,11 @@ def main():
         episode_reward = 0.0  # Total reward per episode
         move_rewards = []
         move_max_visits = []
+        move_count = 0
+        max_moves = config.max_game_moves  # safeguard against infinite self-play
 
         # Self-play game (episode)
-        while not done:
+        while not done and move_count < max_moves:
             mcts = MCTS(agent.net, env_action_size, config.mcts_simulations)
             root = mcts.run(obs)
             invalid_moves = obs[govars.INVD_CHNL]
@@ -604,7 +616,12 @@ def main():
             episode_reward += reward
             move_rewards.append(reward)
             move_max_visits.append(int(np.max(visit_counts)))
+            move_count += 1
 
+        # If max moves reached without termination, force end and log warning
+        if not done:
+            logger.warning(f"Episode {episode_count+1}: reached max moves {move_count}, forcing end.")
+            done = True
         # Add trajectory to replay buffer.
         if config.use_prioritized_replay:
             replay_buffer.add(trajectory)
@@ -657,7 +674,7 @@ def main():
     wandb.finish()
 
 if __name__ == "__main__":
-    wandb.init(project="muzero_go_0423", config=vars(config))
+    wandb.init(project="muzero_go_0424", config=vars(config))
     logger.info("Starting training process...")
     main()
     logger.info("Training completed.")

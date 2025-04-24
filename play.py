@@ -285,7 +285,7 @@ def main():
     agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
     
     # Load weights from a file (provide the file path via command-line or default to "muzero_model_final.pth")
-    weight_file = sys.argv[1] if len(sys.argv) > 1 else "/gpfs/scratch/wz1492/MuZero-Go/checkpoints/ymjsx1gh/muzero_model_episode_250.pth"
+    weight_file = sys.argv[1] if len(sys.argv) > 1 else "/gpfs/scratch/wz1492/MuZero-Go/checkpoints/3jxtdof3/muzero_model_episode_500.pth"
     try:
         state_dict = torch.load(weight_file, map_location=device)
         agent.net.load_state_dict(state_dict)
@@ -306,9 +306,12 @@ def main():
     if isinstance(observation, tuple):
         observation = observation[0]
     done = False
+    # safeguard: prevent infinite interactive games
+    move_count = 0
+    max_moves = board_size * board_size * 2
     # In Go, Black (first player) starts.
     human_turn = human_is_black
-    while not done:
+    while not done and move_count < max_moves:
         print_board(observation, board_size)
         if human_turn:
             move = input("Your move (e.g., A1 or 'pass'): ")
@@ -329,6 +332,11 @@ def main():
         if isinstance(observation, tuple):
             observation = observation[0]
         human_turn = not human_turn
+        move_count += 1
+    # If max moves reached without end, force game over
+    if not done:
+        print(f"Reached max moves {move_count}, forcing game end.")
+        done = True
     print_board(observation, board_size)
     print("Game over!")
     if reward > 0:
