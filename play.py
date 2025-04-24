@@ -20,6 +20,7 @@ class Config:
     dirichlet_epsilon = 0.02
     dirichlet_alpha = 0.01
     discount = 0.99
+    pass_epsilon = 0.01  # Prior weight for pass when board moves exist
 
 config = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,7 +113,7 @@ class MCTSNode:
         return self.value_sum / self.visit_count if self.visit_count > 0 else 0
 
 class MCTS:
-    def __init__(self, muzero_net, action_size, num_simulations, c_puct=3.0):
+    def __init__(self, muzero_net, action_size, num_simulations, c_puct=10.0):
         self.net = muzero_net
         self.action_size = action_size
         self.num_simulations = num_simulations
@@ -121,10 +122,15 @@ class MCTS:
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(device)
         latent, value, policy_logits = self.net.initial_inference(obs_tensor)
         policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
-        # Use the invalid move mask from the observation.
+        # Use the invalid move mask from the observation and penalize pass
         invalid_moves = observation[govars.INVD_CHNL]
-        valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-        valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+        valid_board = (invalid_moves.flatten() == 0).astype(np.float32)
+        # Penalize pass when board moves exist, full weight if no board moves left
+        if valid_board.sum() > 0:
+            pass_prior = config.pass_epsilon
+        else:
+            pass_prior = 1.0
+        valid_mask = np.concatenate([valid_board, np.array([pass_prior])])
         policy *= valid_mask
         policy_sum = policy.sum()
         if policy_sum > 0:
@@ -219,8 +225,12 @@ class MuZeroAgent:
         self.mcts_simulations = num_simulations
     def select_action(self, observation):
         invalid_moves = observation[govars.INVD_CHNL]
-        valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-        valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+        valid_board = (invalid_moves.flatten() == 0).astype(np.float32)
+        if valid_board.sum() > 0:
+            pass_prior = config.pass_epsilon
+        else:
+            pass_prior = 1.0
+        valid_mask = np.concatenate([valid_board, np.array([pass_prior])])
         mcts = MCTS(self.net, self.action_size, self.mcts_simulations)
         root = mcts.run(observation)
         visit_counts = np.array([
@@ -275,7 +285,7 @@ def main():
     agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
     
     # Load weights from a file (provide the file path via command-line or default to "muzero_model_final.pth")
-    weight_file = sys.argv[1] if len(sys.argv) > 1 else "/gpfs/scratch/wz1492/MuZero-Go/muzero_model_episode_4000.pth"
+    weight_file = sys.argv[1] if len(sys.argv) > 1 else "/gpfs/scratch/wz1492/MuZero-Go/checkpoints/ymjsx1gh/muzero_model_episode_250.pth"
     try:
         state_dict = torch.load(weight_file, map_location=device)
         agent.net.load_state_dict(state_dict)

@@ -46,6 +46,7 @@ class Config:
     use_value_transform = True     # Set True for visually complex domains (e.g. Atari)
     use_prioritized_replay = True  # Enable prioritized replay for faster, focused learning
     prioritized_replay_beta = 0.6  # Exponent for importance sampling weights
+    pass_epsilon = 0.01  # Prior weight for pass when board moves exist
 
 config = Config()
 
@@ -177,18 +178,24 @@ class PrioritizedReplayBuffer:
 class MCTS:
     def __init__(self, muzero_net, action_size, num_simulations, c_puct=5.0):
         self.net = muzero_net
+        self.net.eval()
         self.action_size = action_size
         self.num_simulations = num_simulations
         self.c_puct = c_puct
 
+    @torch.no_grad()
     def run(self, observation):
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(device)
         latent, value, policy_logits = self.net.initial_inference(obs_tensor)
         policy = torch.softmax(policy_logits, dim=1).detach().cpu().numpy()[0]
 
         invalid_moves = observation[govars.INVD_CHNL]
-        valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-        valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+        valid_board = (invalid_moves.flatten() == 0).astype(np.float32)
+        if valid_board.sum() > 0:
+            pass_prior = config.pass_epsilon
+        else:
+            pass_prior = 1.0
+        valid_mask = np.concatenate([valid_board, np.array([pass_prior])])
 
         # Zero-out invalid moves and normalize.
         policy *= valid_mask
@@ -473,8 +480,12 @@ class SelfPlayEvaluator:
                 mcts = MCTS(self.best_agent.net, self.best_agent.action_size, self.best_agent.mcts_simulations)
             root = mcts.run(obs)
             invalid_moves = obs[govars.INVD_CHNL]
-            valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-            valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+            valid_board = (invalid_moves.flatten() == 0).astype(np.float32)
+            if valid_board.sum() > 0:
+                pass_prior = config.pass_epsilon
+            else:
+                pass_prior = 1.0
+            valid_mask = np.concatenate([valid_board, np.array([pass_prior])])
             visit_counts = np.array([
                 child['node'].visit_count if (child['node'] is not None and valid_mask[a] > 0) else 0 
                 for a, child in root.children.items()
@@ -516,7 +527,12 @@ class SelfPlayEvaluator:
 
 # Main training loop using a single environment.
 def main():
-    checkpoint_dir = "checkpoints"
+    # Create a unique checkpoint directory for this run
+    base_ckpt_dir = "checkpoints"
+    os.makedirs(base_ckpt_dir, exist_ok=True)
+    # Use WandB run ID if available, else timestamp
+    run_id = wandb.run.id if (hasattr(wandb, 'run') and wandb.run is not None) else time.strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = os.path.join(base_ckpt_dir, run_id)
     os.makedirs(checkpoint_dir, exist_ok=True)
     board_size = config.board_size  # Fixed board size of 6
     env_action_size = board_size * board_size + 1
@@ -532,7 +548,7 @@ def main():
     selfplay_evaluator = SelfPlayEvaluator(agent, best_agent, env, num_games=20)
     
     episode_count = 0
-    start_time = time.time()
+    last_time = time.time()
 
     while episode_count < config.num_episodes:
         obs = env.reset()
@@ -554,8 +570,12 @@ def main():
             mcts = MCTS(agent.net, env_action_size, config.mcts_simulations)
             root = mcts.run(obs)
             invalid_moves = obs[govars.INVD_CHNL]
-            valid_mask = (invalid_moves.flatten() == 0).astype(np.float32)
-            valid_mask = np.concatenate([valid_mask, np.array([1.0])])
+            valid_board = (invalid_moves.flatten() == 0).astype(np.float32)
+            if valid_board.sum() > 0:
+                pass_prior = config.pass_epsilon
+            else:
+                pass_prior = 1.0
+            valid_mask = np.concatenate([valid_board, np.array([pass_prior])])
             visit_counts = np.array([
                 child['node'].visit_count if (child['node'] is not None and valid_mask[a] > 0) else 0 
                 for a, child in root.children.items()
@@ -591,7 +611,9 @@ def main():
         else:
             replay_buffer.append(trajectory)
         episode_count += 1
-        elapsed = time.time() - start_time
+        current_time = time.time()
+        elapsed = current_time - last_time
+        last_time = current_time
         avg_move_reward = np.mean(move_rewards) if move_rewards else 0.0
         avg_move_max_visit = np.mean(move_max_visits) if move_max_visits else 0.0
 
@@ -618,18 +640,24 @@ def main():
                 best_agent.net.load_state_dict(agent.net.state_dict())
                 logger.info("Best agent updated with current agent's parameters.")
 
-            if episode_count % 2000 == 0:
+            if episode_count % 250 == 0:
+                # Save checkpoint every 250 episodes
                 model_path = os.path.join(checkpoint_dir, f"muzero_model_episode_{episode_count}.pth")
-                model_path = f"muzero_model_episode_{episode_count}.pth"
                 torch.save(agent.net.state_dict(), model_path)
                 wandb.save(model_path)
+                logger.info(f"Saved checkpoint weights at episode {episode_count} to {model_path}")
+            # reset timer after evaluation to avoid including evaluation overhead in next episode's elapsed time
+            last_time = time.time()
 
-    torch.save(agent.net.state_dict(), "muzero_model_final.pth")
-    wandb.save("muzero_model_final.pth")
+    # Save final model weights
+    final_model_path = os.path.join(checkpoint_dir, "muzero_model_final.pth")
+    torch.save(agent.net.state_dict(), final_model_path)
+    wandb.save(final_model_path)
+    logger.info(f"Saved final model weights to {final_model_path}")
     wandb.finish()
 
 if __name__ == "__main__":
-    wandb.init(project="muzero_go_single", config=vars(config))
+    wandb.init(project="muzero_go_0423", config=vars(config))
     logger.info("Starting training process...")
     main()
     logger.info("Training completed.")
