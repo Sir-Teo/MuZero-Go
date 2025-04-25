@@ -29,7 +29,7 @@ class Config:
     latent_dim = 64
     learning_rate = 1e-4
     mcts_simulations = 128      # increased MCTS rollouts for stronger self-play targets
-    num_episodes = 200000
+    num_episodes = 50000
     replay_buffer_size = 5000   # larger buffer for more diverse experience
     batch_size = 128            # larger batches for stable updates
     unroll_steps = 16
@@ -42,12 +42,15 @@ class Config:
     initial_elo = 1000
     elo_k = 32
     evaluation_interval = 10
+    evaluation_num_games = 50   # Number of games to play during evaluation match
+    evaluation_win_threshold = 0.55  # Win rate threshold to promote new weights
     # New flags for reward/value scaling and prioritized replay
     use_value_transform = True     # Set True for visually complex domains (e.g. Atari)
     use_prioritized_replay = True  # Enable prioritized replay for faster, focused learning
     prioritized_replay_beta = 0.6  # Exponent for importance sampling weights
-    pass_epsilon = 0.01  # Prior weight for pass when board moves exist
-    max_game_moves = board_size * board_size * 2  # max moves before force-ending a game
+    pass_epsilon = 0.05  # Prior weight for pass when board moves exist
+    max_game_moves = board_size * board_size * 2   # max moves before force-ending a game
+    num_replay_versions = 3   # number of past model versions to maintain replay buffers for
 
 config = Config()
 
@@ -174,6 +177,70 @@ class PrioritizedReplayBuffer:
     def update_priorities(self, indices, new_priorities):
         for i, p in zip(indices, new_priorities):
             self.priorities[i] = p
+
+# Multi-version replay buffer to maintain buffers across past model versions
+class MultiVersionReplayBuffer:
+    def __init__(self, capacity, num_versions, prioritized):
+        self.capacity = capacity
+        self.num_versions = num_versions
+        self.prioritized = prioritized
+        self.buffers = deque(maxlen=num_versions)
+        self.add_version()
+
+    def add_version(self):
+        if self.prioritized:
+            buf = PrioritizedReplayBuffer(self.capacity)
+        else:
+            buf = deque(maxlen=self.capacity)
+        self.buffers.append(buf)
+
+    def add(self, trajectory):
+        if self.prioritized:
+            self.buffers[-1].add(trajectory)
+        else:
+            self.buffers[-1].append(trajectory)
+
+    def sample(self, batch_size):
+        if self.prioritized:
+            combined = []
+            combined_p = []
+            for buf in self.buffers:
+                combined.extend(buf.buffer)
+                combined_p.extend(buf.priorities)
+            if len(combined) < batch_size:
+                return [], []
+            probs = np.array(combined_p) / sum(combined_p)
+            indices = np.random.choice(len(combined), batch_size, replace=False, p=probs)
+            samples = [combined[i] for i in indices]
+            boundaries = []
+            cum = 0
+            for buf in self.buffers:
+                boundaries.append(cum)
+                cum += len(buf.buffer)
+            boundaries.append(cum)
+            mapping = []
+            for i in indices:
+                for idx_buf in range(len(boundaries)-1):
+                    if boundaries[idx_buf] <= i < boundaries[idx_buf+1]:
+                        local = i - boundaries[idx_buf]
+                        mapping.append((idx_buf, local))
+                        break
+            return samples, mapping
+        else:
+            combined = []
+            for buf in self.buffers:
+                combined.extend(buf)
+            if len(combined) < batch_size:
+                return [], []
+            samples = random.sample(combined, batch_size)
+            return samples, None
+
+    def update_priorities(self, mapping, new_priorities):
+        if not self.prioritized or mapping is None:
+            return
+        for (buf_idx, local_idx), p in zip(mapping, new_priorities):
+            if buf_idx < len(self.buffers):
+                self.buffers[buf_idx].priorities[local_idx] = p
 
 # Monte Carlo Tree Search (MCTS) implementation with Q-value normalization.
 class MCTS:
@@ -312,16 +379,10 @@ class MuZeroAgent:
         self.scheduler = StepLR(self.optimizer, step_size=1000, gamma=0.9)
 
     def train(self, replay_buffer, batch_size):
-        # Use prioritized replay if enabled.
-        if config.use_prioritized_replay:
-            if len(replay_buffer.buffer) < batch_size:
-                return None
-            batch, indices = replay_buffer.sample(batch_size)
-        else:
-            if len(replay_buffer) < batch_size:
-                return None
-            batch = random.sample(replay_buffer, batch_size)
-
+        # Sample a batch from the (possibly multi-version) replay buffer.
+        batch, indices = replay_buffer.sample(batch_size)
+        if not batch or len(batch) < batch_size:
+            return None
         loss_total = 0.0
         total_value_loss = 0.0
         total_policy_loss = 0.0
@@ -431,7 +492,7 @@ class MuZeroAgent:
             "reward_loss": total_reward_loss / batch_size
         })
 
-        if config.use_prioritized_replay:
+        if indices is not None:
             new_priorities = [avg_loss] * len(indices)
             replay_buffer.update_priorities(indices, new_priorities)
         # step the learning-rate scheduler and log the current lr
@@ -476,6 +537,8 @@ class SelfPlayEvaluator:
         turn = starting_player
         move_count = 0
         max_moves = config.max_game_moves
+        pass_count = 0  # track consecutive passes
+        pass_action = self.current_agent.action_size - 1  # index for pass action
         # play until game ends or max moves reached
         while not done and move_count < max_moves:
             if turn == 0:
@@ -510,6 +573,14 @@ class SelfPlayEvaluator:
             # increment move counter and toggle turn
             move_count += 1
             turn = 1 - turn
+            # Update consecutive pass count to detect game end
+            if action == pass_action:
+                pass_count += 1
+            else:
+                pass_count = 0
+            if pass_count >= 2:
+                done = True
+                break
         # if we exited due to move limit, log warning and force end
         if move_count >= max_moves:
             logger.warning(f"Evaluation game reached max moves ({move_count}), forcing end.")
@@ -551,11 +622,9 @@ def main():
     best_agent.net.load_state_dict(agent.net.state_dict())
     
     env = gym.make("gym_go:go-v0", size=board_size, komi=0, reward_method='real')
-    if config.use_prioritized_replay:
-        replay_buffer = PrioritizedReplayBuffer(config.replay_buffer_size)
-    else:
-        replay_buffer = deque(maxlen=config.replay_buffer_size)
-    selfplay_evaluator = SelfPlayEvaluator(agent, best_agent, env, num_games=20)
+    # Initialize multi-version replay buffer
+    replay_buffer = MultiVersionReplayBuffer(config.replay_buffer_size, config.num_replay_versions, config.use_prioritized_replay)
+    selfplay_evaluator = SelfPlayEvaluator(agent, best_agent, env, num_games=config.evaluation_num_games)
     
     episode_count = 0
     last_time = time.time()
@@ -576,6 +645,8 @@ def main():
         move_max_visits = []
         move_count = 0
         max_moves = config.max_game_moves  # safeguard against infinite self-play
+        pass_count = 0  # track consecutive passes
+        pass_action = env_action_size - 1  # index for pass action
 
         # Self-play game (episode)
         while not done and move_count < max_moves:
@@ -617,16 +688,21 @@ def main():
             move_rewards.append(reward)
             move_max_visits.append(int(np.max(visit_counts)))
             move_count += 1
+            # Update consecutive pass count to detect game end
+            if action == pass_action:
+                pass_count += 1
+            else:
+                pass_count = 0
+            if pass_count >= 2:
+                done = True
+                break
 
         # If max moves reached without termination, force end and log warning
         if not done:
             logger.warning(f"Episode {episode_count+1}: reached max moves {move_count}, forcing end.")
             done = True
         # Add trajectory to replay buffer.
-        if config.use_prioritized_replay:
-            replay_buffer.add(trajectory)
-        else:
-            replay_buffer.append(trajectory)
+        replay_buffer.add(trajectory)
         episode_count += 1
         current_time = time.time()
         elapsed = current_time - last_time
@@ -653,12 +729,17 @@ def main():
             win_rate, new_elo = selfplay_evaluator.evaluate()
             logger.info(f"Self-play Evaluation at Episode {episode_count} | Win Rate: {win_rate:.2f} | Elo: {new_elo:.2f}")
             wandb.log({"selfplay_win_rate": win_rate, "selfplay_elo": new_elo, "episode": episode_count})
-            if win_rate > 0.55:
+            if win_rate > config.evaluation_win_threshold:
                 best_agent.net.load_state_dict(agent.net.state_dict())
-                logger.info("Best agent updated with current agent's parameters.")
+                logger.info(f"New agent promoted as best with win rate {win_rate:.2f}.")
+                # Start collecting self-play data in a new buffer for the promoted model version
+                replay_buffer.add_version()
+            else:
+                agent.net.load_state_dict(best_agent.net.state_dict())
+                logger.info(f"Reverted agent to previous best due to insufficient win rate {win_rate:.2f}.")
 
-            if episode_count % 250 == 0:
-                # Save checkpoint every 250 episodes
+            if episode_count % 100 == 0:
+                # Save checkpoint every 100 episodes
                 model_path = os.path.join(checkpoint_dir, f"muzero_model_episode_{episode_count}.pth")
                 torch.save(agent.net.state_dict(), model_path)
                 wandb.save(model_path)
@@ -674,7 +755,7 @@ def main():
     wandb.finish()
 
 if __name__ == "__main__":
-    wandb.init(project="muzero_go_0424", config=vars(config))
+    wandb.init(project="muzero_go_0426", config=vars(config))
     logger.info("Starting training process...")
     main()
     logger.info("Training completed.")
