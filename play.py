@@ -220,7 +220,7 @@ class MuZeroAgent:
     def __init__(self, board_size, latent_dim, env_action_size, num_simulations):
         self.board_size = board_size
         self.action_size = env_action_size
-        max_action_size = board_size * board_size + 1
+        max_action_size = int((board_size * board_size * 1.5))
         self.net = MuZeroNet(latent_dim, max_action_size).to(device)
         self.mcts_simulations = num_simulations
     def select_action(self, observation):

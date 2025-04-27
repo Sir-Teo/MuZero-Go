@@ -18,10 +18,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="gym.utils.passiv
 # --- Configuration (copied from play.py, consider moving to a shared config file) ---
 class Config:
     board_size = 6
-    latent_dim = 64
-    mcts_simulations = 64  # Number of simulations per move
+    latent_dim = 96
+    mcts_simulations = 128  # Number of simulations per move
     dirichlet_epsilon = 0.02
-    dirichlet_alpha = 0.01
+    dirichlet_alpha = 0.15
     discount = 0.99
     pass_epsilon = 0.01  # Prior weight for pass when board moves exist
     # Self-play specific config
@@ -139,7 +139,7 @@ class MCTSNode:
         return self.value_sum / self.visit_count if self.visit_count > 0 else 0
 
 class MCTS:
-    def __init__(self, muzero_net, action_size, num_simulations, c_puct=10.0):
+    def __init__(self, muzero_net, action_size, num_simulations, c_puct=2.5):
         self.net = muzero_net
         self.action_size = action_size
         self.num_simulations = num_simulations
@@ -347,7 +347,9 @@ class MuZeroAgent:
     def __init__(self, board_size, latent_dim, env_action_size, num_simulations):
         self.board_size = board_size
         self.action_size = env_action_size
-        max_action_size = board_size * board_size + 1
+
+        #max_action_size = int((board_size * board_size * 1.5))
+        max_action_size = board_size * board_size +1
         self.net = MuZeroNet(latent_dim, max_action_size).to(device)
         self.net.eval() # Set to evaluation mode
         self.mcts_simulations = num_simulations
@@ -526,8 +528,8 @@ def run_self_play_game(agent, env, config):
 # --- Main Execution ---
 def main():
     parser = argparse.ArgumentParser(description="Run MuZero self-play.")
-    parser.add_argument("--weights", default="/gpfs/scratch/wz1492/MuZero-Go/checkpoints/0b7s2x0m/muzero_model_episode_500.pth", type=str,help="Path to the MuZero model weights (.pth file).")
-    parser.add_argument("--num_games", type=int, default=100, help="Number of self-play games to run.")
+    parser.add_argument("--weights", default="/gpfs/scratch/wz1492/MuZero-Go/checkpoints/o0uy97a9/muzero_model_episode_2500.pth", type=str,help="Path to the MuZero model weights (.pth file).")
+    parser.add_argument("--num_games", type=int, default=1, help="Number of self-play games to run.")
     parser.add_argument("--output_dir", type=str, default="self_play_data", help="Directory to save game data.")
     parser.add_argument("--simulations", type=int, default=config.mcts_simulations, help="Number of MCTS simulations per move.")
     args = parser.parse_args()

@@ -174,3 +174,4 @@ log/
 wandb/
 
 *.pth
+*.pkl

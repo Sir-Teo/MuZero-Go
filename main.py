@@ -47,10 +47,10 @@ class Config:
     # New flags for reward/value scaling and prioritized replay
     use_value_transform = True     # Set True for visually complex domains (e.g. Atari)
     use_prioritized_replay = True  # Enable prioritized replay for faster, focused learning
-    prioritized_replay_beta = 0.6  # Exponent for importance sampling weights
+    prioritized_replay_beta = 0.5  # Exponent for importance sampling weights
     pass_epsilon = 0.05  # Prior weight for pass when board moves exist
-    max_game_moves = board_size * board_size * 2   # max moves before force-ending a game
-    num_replay_versions = 3   # number of past model versions to maintain replay buffers for
+    max_game_moves = int((board_size * board_size * 1.5)) 
+    num_replay_versions = 1   # number of past model versions to maintain replay buffers for
 
 config = Config()
 
@@ -504,6 +504,7 @@ class MuZeroAgent:
         target = 0.0
         discount_factor = 1.0
         T = len(trajectory['rewards'])
+        # sum up all actual rewards
         for k in range(unroll_steps):
             j = index + k
             if j < T:
@@ -511,13 +512,15 @@ class MuZeroAgent:
                 discount_factor *= config.discount
             else:
                 break
-        if index + unroll_steps < len(trajectory['observations']):
+        # only bootstrap if we haven't reached the end of the game
+        if index + unroll_steps < T:
             obs = trajectory['observations'][index + unroll_steps]
             obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)
             with torch.no_grad():
                 _, value, _ = self.net.initial_inference(obs_tensor)
             target += discount_factor * value.item()
         return target
+
 
 # Self-play evaluator to compare current agent against best agent.
 class SelfPlayEvaluator:
@@ -601,8 +604,9 @@ class SelfPlayEvaluator:
             current_wins += result
         win_rate = current_wins / self.num_games
         expected_score = 1 / (1 + 10 ** ((self.best_elo - self.current_elo) / 400))
-        self.current_elo += config.elo_k * (win_rate - expected_score)
-        self.best_elo += config.elo_k * ((1 - win_rate) - (1 - expected_score))
+        if win_rate > config.evaluation_win_threshold:
+            self.current_elo += config.elo_k * (win_rate - expected_score)
+            self.best_elo += config.elo_k * ((1 - win_rate) - (1 - expected_score))
         wandb.log({"selfplay_win_rate": win_rate, "current_elo": self.current_elo})
         return win_rate, self.current_elo
 
@@ -696,13 +700,18 @@ def main():
             if pass_count >= 2:
                 done = True
                 break
-
-        # If max moves reached without termination, force end and log warning
         if not done:
             logger.warning(f"Episode {episode_count+1}: reached max moves {move_count}, forcing end.")
             done = True
-        # Add trajectory to replay buffer.
+            trajectory['rewards'][-1] += -0.5  
+
+        # --- Append final game outcome reward so trajectories carry win/loss signal ---
+        winner = env.winner()           # +1 if black wins, -1 if white wins
+        trajectory['rewards'].append(float(winner))
+        trajectory['observations'].append(obs)  # terminal state
+        # ---------------------------------------------------------------------------
         replay_buffer.add(trajectory)
+
         episode_count += 1
         current_time = time.time()
         elapsed = current_time - last_time
@@ -755,7 +764,7 @@ def main():
     wandb.finish()
 
 if __name__ == "__main__":
-    wandb.init(project="muzero_go_0426", config=vars(config))
+    wandb.init(project="muzero_go_0427", config=vars(config))
     logger.info("Starting training process...")
     main()
     logger.info("Training completed.")
