@@ -26,19 +26,20 @@ logger = logging.getLogger(__name__)
 # Configuration & Hyperparameters
 class Config:
     board_size = 6      # Fixed board size (used for training and maximum action space)
-    latent_dim = 64
+    latent_dim = 128
+    max_action_size = board_size * board_size + 1 # Explicit action size for network
     learning_rate = 1e-4
-    mcts_simulations = 128      # increased MCTS rollouts for stronger self-play targets
+    mcts_simulations = 256      # increased MCTS rollouts for stronger self-play targets
     num_episodes = 50000
     replay_buffer_size = 5000   # larger buffer for more diverse experience
     batch_size = 128            # larger batches for stable updates
-    unroll_steps = 16
+    unroll_steps = 10
     discount = 0.99
     value_loss_weight = 1.0
     policy_loss_weight = 1.0
-    reward_loss_weight = 5.0
-    dirichlet_epsilon = 0.1
-    dirichlet_alpha = 0.1
+    reward_loss_weight = 1.0
+    dirichlet_epsilon = 0.25
+    dirichlet_alpha = 0.03
     initial_elo = 1000
     elo_k = 32
     evaluation_interval = 10
@@ -244,7 +245,7 @@ class MultiVersionReplayBuffer:
 
 # Monte Carlo Tree Search (MCTS) implementation with Q-value normalization.
 class MCTS:
-    def __init__(self, muzero_net, action_size, num_simulations, c_puct=5.0):
+    def __init__(self, muzero_net, action_size, num_simulations, c_puct=2):
         self.net = muzero_net
         self.net.eval()
         self.action_size = action_size
@@ -371,8 +372,7 @@ class MuZeroAgent:
     def __init__(self, board_size, latent_dim, env_action_size, num_simulations):
         self.board_size = board_size
         self.action_size = env_action_size
-        max_action_size = board_size * board_size + 1  # board moves plus pass
-        self.net = MuZeroNet(latent_dim, max_action_size).to(device)
+        self.net = MuZeroNet(latent_dim, config.max_action_size).to(device)
         self.mcts_simulations = num_simulations
         self.optimizer = optim.Adam(self.net.parameters(), lr=config.learning_rate)
         # set up a learning-rate scheduler for gradual annealing
@@ -620,7 +620,7 @@ def main():
     checkpoint_dir = os.path.join(base_ckpt_dir, run_id)
     os.makedirs(checkpoint_dir, exist_ok=True)
     board_size = config.board_size  # Fixed board size of 6
-    env_action_size = board_size * board_size + 1
+    env_action_size = config.max_action_size
     agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
     best_agent = MuZeroAgent(board_size, config.latent_dim, env_action_size, config.mcts_simulations)
     best_agent.net.load_state_dict(agent.net.state_dict())

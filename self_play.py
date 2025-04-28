@@ -19,6 +19,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="gym.utils.passiv
 class Config:
     board_size = 6
     latent_dim = 96
+    max_action_size = board_size * board_size + 1 # Explicit action size for network
     mcts_simulations = 128  # Number of simulations per move
     dirichlet_epsilon = 0.02
     dirichlet_alpha = 0.15
@@ -349,8 +350,7 @@ class MuZeroAgent:
         self.action_size = env_action_size
 
         #max_action_size = int((board_size * board_size * 1.5))
-        max_action_size = board_size * board_size +1
-        self.net = MuZeroNet(latent_dim, max_action_size).to(device)
+        self.net = MuZeroNet(latent_dim, config.max_action_size).to(device)
         self.net.eval() # Set to evaluation mode
         self.mcts_simulations = num_simulations
 
@@ -528,7 +528,7 @@ def run_self_play_game(agent, env, config):
 # --- Main Execution ---
 def main():
     parser = argparse.ArgumentParser(description="Run MuZero self-play.")
-    parser.add_argument("--weights", default="/gpfs/scratch/wz1492/MuZero-Go/checkpoints/o0uy97a9/muzero_model_episode_2500.pth", type=str,help="Path to the MuZero model weights (.pth file).")
+    parser.add_argument("--weights", default="/gpfs/scratch/wz1492/MuZero-Go/checkpoints/tnafcq8e/muzero_model_episode_2100.pth", type=str,help="Path to the MuZero model weights (.pth file).")
     parser.add_argument("--num_games", type=int, default=1, help="Number of self-play games to run.")
     parser.add_argument("--output_dir", type=str, default="self_play_data", help="Directory to save game data.")
     parser.add_argument("--simulations", type=int, default=config.mcts_simulations, help="Number of MCTS simulations per move.")
